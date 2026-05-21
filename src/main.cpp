@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <HTTPClient.h>
 // arduino-esp32 v3 dropped the implicit `using fs::File`; pull it back so
 // the upstream `File f = LittleFS.open(...)` style keeps compiling.
 using fs::File;
@@ -116,19 +117,27 @@ static void applyBrightness() { M5.Axp.ScreenBreath(20 + brightLevel * 20); }
 // (defined earlier in the file) can reset the RTC-read cache.
 extern uint32_t _clkLastRead;
 
-// Timezone offset from UTC in seconds. Runtime-only (not persisted) —
-// desktop bridge time message writes this on connect; absent that, we
-// stay at UTC. Saving it would survive reboot but the user explicitly
-// vetoed that — and a fresh boot with WiFi will pick up tz on the next
-// desktop pair anyway.
+// Local UTC offset in seconds. Runtime mirror of settings().tzOffsetSec —
+// kept as a non-namespaced global because data.h's _applyJson needs to
+// patch it from a different translation unit via `extern int32_t`. Three
+// independent updaters: settingsLoad() on boot (NVS), desktop bridge,
+// GeoIP autodetect. _applyTzOffsetChange() reapplies the wall clock
+// whenever this value moves.
 int32_t _tzOffsetSec = 0;
 
-// State for NTP drift measurement (also used by correctedTime()).
-static uint32_t _ntpLastSyncMs      = 0;   // millis() right after we applied truth
-static uint32_t _ntpLastSyncSysTime = 0;   // time(NULL) value at that moment
+// State for NTP drift measurement + tz-change re-application. Truth UTC
+// at last sync is the source of all subsequent time computation; we
+// derive local-on-display by adding _tzOffsetSec at read time, so a tz
+// flip after sync repaints the clock without losing accuracy.
+static uint32_t _ntpLastSyncMs  = 0;   // millis() at the moment of last sync
+static uint32_t _ntpLastSyncUtc = 0;   // truth UTC seconds at last sync
 
-// Apply UTC truth to the system clock + M5.Rtc with the runtime tz applied.
+// Apply UTC truth to the system clock + M5.Rtc using the current
+// _tzOffsetSec. M5Shim's SetTime/SetDate decompose local components into
+// time(NULL) under TZ=UTC0, so time(NULL) ends up holding local-epoch.
 static void _applyTimeUtc(uint32_t utcEpoch) {
+  _ntpLastSyncUtc = utcEpoch;
+  _ntpLastSyncMs  = millis();
   time_t local = (time_t)utcEpoch + _tzOffsetSec;
   struct tm lt; gmtime_r(&local, &lt);
   RTC_TimeTypeDef tm = { (uint8_t)lt.tm_hour, (uint8_t)lt.tm_min, (uint8_t)lt.tm_sec };
@@ -138,8 +147,19 @@ static void _applyTimeUtc(uint32_t utcEpoch) {
   M5.Rtc.SetDate(&dt);
   _clkLastRead = 0;
   _rtcValid = true;
-  _ntpLastSyncMs = millis();
-  _ntpLastSyncSysTime = (uint32_t)time(NULL);
+}
+
+// Called by anyone updating _tzOffsetSec (data.h on desktop time msg,
+// geoipTick on autodetect): replay the current UTC truth through
+// _applyTimeUtc so the wall clock jumps to the new locale immediately
+// instead of waiting for the next hourly NTP resync.
+void _applyTzOffsetChange() {
+  if (_ntpLastSyncMs == 0) return;     // never synced — nothing to repaint
+  uint32_t elapsedMs = millis() - _ntpLastSyncMs;
+  int32_t  drift = stats().clockDriftPpm;
+  int64_t  correctionMs = -((int64_t)elapsedMs * drift) / 1000000LL;
+  uint32_t curUtc = _ntpLastSyncUtc + (elapsedMs + (uint32_t)correctionMs) / 1000;
+  _applyTimeUtc(curUtc);
 }
 
 // Minimal SNTP/UDP client. Hits pool.ntp.org:123 directly so we get truth
@@ -200,17 +220,17 @@ static void ntpTick() {
   }
 
   // Periodic resync: fetch truth via direct UDP NTP, measure drift
-  // against the drifted local time(NULL) BEFORE overwriting it.
-  uint32_t observedLocal = (uint32_t)time(NULL);
-  uint32_t truthUtc      = fetchNtpUtc();
+  // against the drifted local time(NULL) BEFORE overwriting it. Math
+  // runs entirely in UTC so a tz change between syncs doesn't pollute
+  // the measurement.
+  uint32_t observedUtc = (uint32_t)time(NULL) - _tzOffsetSec;
+  uint32_t truthUtc    = fetchNtpUtc();
   if (truthUtc == 0) {
     Serial.println("ntp: udp query failed, will retry next cycle");
     return;
   }
-  uint32_t truthLocal = truthUtc + (uint32_t)_tzOffsetSec;
-  int32_t  driftSec   = (int32_t)observedLocal - (int32_t)truthLocal;
-  // elapsed measured from the *truth* side so it isn't itself drifted
-  int32_t  elapsedSec = (int32_t)truthLocal - (int32_t)_ntpLastSyncSysTime;
+  int32_t  driftSec   = (int32_t)observedUtc - (int32_t)truthUtc;
+  int32_t  elapsedSec = (int32_t)truthUtc - (int32_t)_ntpLastSyncUtc;
 
   if (elapsedSec >= 60) {
     int32_t driftPpm = (int32_t)((int64_t)driftSec * 1000000LL / elapsedSec);
@@ -218,16 +238,68 @@ static void ntpTick() {
     // measurement artefact (sync race, network jitter) — drop it.
     if (driftPpm > -1000 && driftPpm < 1000) {
       statsOnClockDrift(driftPpm);
-      Serial.printf("ntp: resync — drift=%dppm (observed=%lu, truth=%lu, "
+      Serial.printf("ntp: resync — drift=%dppm (observedUtc=%lu, truthUtc=%lu, "
                     "elapsed=%lds, smoothed=%dppm)\n",
-                    driftPpm, (unsigned long)observedLocal,
-                    (unsigned long)truthLocal,
+                    driftPpm, (unsigned long)observedUtc,
+                    (unsigned long)truthUtc,
                     (long)elapsedSec, (int)stats().clockDriftPpm);
     } else {
       Serial.printf("ntp: drift %dppm out of range, ignored\n", driftPpm);
     }
   }
   _applyTimeUtc(truthUtc);
+}
+
+// GeoIP timezone autodetect. Runs once per boot after WiFi up, only if
+// no other source has populated _tzOffsetSec yet (i.e. NVS was empty and
+// the desktop bridge hasn't pushed a time message). Hits worldtimeapi.org
+// over plain HTTP — the response just contains tz offsets, no
+// authentication needed, IP is the implicit query parameter.
+static void geoipTick() {
+  static bool     done           = false;
+  static uint32_t lastAttemptMs  = 0;
+  static uint8_t  attempts       = 0;
+  if (done) return;
+  if (wifiLinkState() != WLINK_CONNECTED) return;
+  // If anyone else (NVS load / desktop / previous geoip) already set tz,
+  // skip — desktop is more accurate, NVS preserves last truth.
+  if (_tzOffsetSec != 0) { done = true; return; }
+  uint32_t now = millis();
+  if (lastAttemptMs && now - lastAttemptMs < 30000) return;   // 30s retry
+  if (attempts >= 5) { done = true; return; }                  // give up after 5
+  lastAttemptMs = now;
+  attempts++;
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(5000);
+  http.setUserAgent("claudegochi-geoip/" FIRMWARE_VERSION);
+  if (!http.begin(client, "http://worldtimeapi.org/api/ip")) return;
+  int code = http.GET();
+  if (code != 200) { http.end(); return; }
+  String body = http.getString();
+  http.end();
+
+  JsonDocument filter;
+  filter["raw_offset"] = true;
+  filter["dst_offset"] = true;
+  JsonDocument doc;
+  if (deserializeJson(doc, body, DeserializationOption::Filter(filter))) return;
+  int32_t raw = doc["raw_offset"] | 0;
+  int32_t dst = doc["dst_offset"] | 0;
+  int32_t newTz = raw + dst;
+  if (newTz == 0) {
+    Serial.println("geoip: offset 0 (UTC) — keeping uncalibrated");
+    done = true;
+    return;
+  }
+  Serial.printf("geoip: tz_offset=%ld sec (raw=%d, dst=%d)\n",
+                (long)newTz, raw, dst);
+  _tzOffsetSec = newTz;
+  settings().tzOffsetSec = newTz;
+  settingsSave();
+  _applyTzOffsetChange();
+  done = true;
 }
 
 // time(NULL) drifts with the crystal between NTP syncs. Apply the
@@ -282,8 +354,8 @@ void applyDisplayMode() {
   characterInvalidate();  // redraws character on next tick (text mode path)
 }
 
-const char* menuItems[] = { "settings", "turn off", "help", "about", "demo", "close" };
-const uint8_t MENU_N = 6;
+const char* menuItems[] = { "settings", "check ota", "turn off", "help", "about", "demo", "close" };
+const uint8_t MENU_N = 7;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
@@ -472,17 +544,25 @@ static void drawReset() {
 void menuConfirm() {
   switch (menuSel) {
     case 0: settingsOpen = true; menuOpen = false; settingsSel = 0; break;
-    case 1: M5.Axp.PowerOff(); break;
-    case 2:
+    case 1:
+      // "check ota" — kick the OTA module's manual check. It picks up
+      // on the next otaTick() (within a frame). Close the menu so the
+      // user sees the resulting OTA progress overlay if an update fires.
+      otaCheckNow();
+      menuOpen = false;
+      characterInvalidate();
+      break;
+    case 2: M5.Axp.PowerOff(); break;
     case 3:
+    case 4:
       menuOpen = false;
       displayMode = DISP_INFO;
-      infoPage = (menuSel == 2) ? INFO_PG_BUTTONS : INFO_PG_CREDITS;
+      infoPage = (menuSel == 3) ? INFO_PG_BUTTONS : INFO_PG_CREDITS;
       applyDisplayMode();
       characterInvalidate();
       break;
-    case 4: dataSetDemo(!dataDemo()); break;
-    case 5: menuOpen = false; characterInvalidate(); break;
+    case 5: dataSetDemo(!dataDemo()); break;
+    case 6: menuOpen = false; characterInvalidate(); break;
   }
 }
 
@@ -1249,6 +1329,10 @@ void setup() {
   // hardcoded default 4 before settling on whatever the user picked.
   brightLevel = settings().bright;
   applyBrightness();
+  // Same idea for the timezone: NVS holds the last known offset (from
+  // either GeoIP or desktop). Populating early lets the first clock
+  // refresh + the first NTP sync apply local time without a UTC flash.
+  _tzOffsetSec = settings().tzOffsetSec;
   petNameLoad();
   buddyInit();
 
@@ -1314,6 +1398,7 @@ void loop() {
   dataPoll(&tama);
   wifiLinkTick();
   ntpTick();
+  geoipTick();
   otaTick();
 
   // Feed the mood-activity ring on every transcript bump — proxies "Claude

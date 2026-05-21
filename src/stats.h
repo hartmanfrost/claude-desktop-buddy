@@ -270,9 +270,15 @@ struct Settings {
   bool hud;
   uint8_t clockRot;  // 0=auto 1=portrait 2=landscape
   uint8_t bright;    // 0..4 → ScreenBreath 20..100 in applyBrightness()
+  // Local UTC offset in seconds. Three independent sources write this:
+  // (a) GeoIP autodetect at first boot, (b) desktop bridge time msg (most
+  // accurate, overrides everything), (c) NVS persistence across reboots
+  // so the device stays localised even without WiFi/desktop. Default 0
+  // = UTC if none of the above has fired yet.
+  int32_t tzOffsetSec;
 };
 
-static Settings _settings = { true, true, false, true, true, 0, 4 };
+static Settings _settings = { true, true, false, true, true, 0, 4, 0 };
 
 inline void settingsLoad() {
   _prefs.begin("buddy", true);
@@ -288,6 +294,7 @@ inline void settingsLoad() {
   // brightness change writes the key and it sticks from then on.
   _settings.bright = _prefs.getUChar("s_bright", 4);
   if (_settings.bright > 4) _settings.bright = 4;
+  _settings.tzOffsetSec = _prefs.getInt("s_tz", 0);
   _prefs.end();
 }
 
@@ -300,6 +307,7 @@ inline void settingsSave() {
   _prefs.putBool("s_hud", _settings.hud);
   _prefs.putUChar("s_crot", _settings.clockRot);
   _prefs.putUChar("s_bright", _settings.bright);
+  _prefs.putInt("s_tz", _settings.tzOffsetSec);
   _prefs.end();
 }
 

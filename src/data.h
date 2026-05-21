@@ -92,11 +92,22 @@ static void _applyJson(const char* line, TamaState* out) {
   JsonArray t = doc["time"];
   if (!t.isNull() && t.size() == 2) {
     int32_t tzOff = (int32_t)t[1];
-    // Push tz into the runtime global so ntpTick can localise NTP UTC
-    // for the rest of this boot. Not persisted — fresh boots without a
-    // desktop fall back to UTC display until pair-up.
+    // Desktop is the most authoritative tz source — it knows the user's
+    // OS locale. Patch the runtime global so the NTP sync below uses the
+    // right offset, and persist to NVS (if changed) so subsequent boots
+    // without desktop or GeoIP stay localised. Trigger an immediate
+    // wall-clock reapply via _applyTzOffsetChange — that way a tz flip
+    // (DST switch / travelling user paired in new timezone) doesn't wait
+    // for the next hourly NTP cycle.
     extern int32_t _tzOffsetSec;
+    extern void    _applyTzOffsetChange();
+    bool tzChanged = (_tzOffsetSec != tzOff);
     _tzOffsetSec = tzOff;
+    if (settings().tzOffsetSec != tzOff) {
+      settings().tzOffsetSec = tzOff;
+      settingsSave();
+    }
+    if (tzChanged) _applyTzOffsetChange();
     time_t local = (time_t)t[0].as<uint32_t>() + tzOff;
     struct tm lt; gmtime_r(&local, &lt);
     RTC_TimeTypeDef tm = { (uint8_t)lt.tm_hour, (uint8_t)lt.tm_min, (uint8_t)lt.tm_sec };
