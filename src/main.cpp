@@ -1,6 +1,11 @@
 #include <M5StickCPlus.h>
 #include <LittleFS.h>
+#include <FS.h>
+#include <esp_mac.h>
 #include <stdarg.h>
+// arduino-esp32 v3 dropped the implicit `using fs::File`; pull it back so
+// the upstream `File f = LittleFS.open(...)` style keeps compiling.
+using fs::File;
 #include "ble_bridge.h"
 #include "data.h"
 #include "buddy.h"
@@ -20,10 +25,18 @@ static void startBt() {
 
 #include "character.h"
 #include "stats.h"
-const int W = 135, H = 240;
+#include "wifi_link.h"
+#include "ota_update.h"
+// ST7789 panel on the Waveshare board reports 172x320 in portrait. The
+// menu / panel layout below auto-centers; the pet and HUD areas use these
+// constants directly so widening the canvas just adds breathing room.
+const int W = 172, H = 320;
 const int CX = W / 2;
-const int CY_BASE = 120;
-const int LED_PIN = 10;          // red LED, active-low
+const int CY_BASE = H / 2;
+// On M5StickC this drove an active-low red LED on GPIO10. The Waveshare
+// board has no plain LED — only a WS2812 fired through M5.Beep — so the
+// pulse path is gated on LED_PIN >= 0 to stay a no-op here.
+const int LED_PIN = -1;
 
 // Colors used across multiple UI surfaces
 const uint16_t HOT   = 0xFA20;   // red-orange: warnings, impatience, deny
@@ -83,8 +96,6 @@ static void nextPet() {
 uint32_t wakeTransitionUntil = 0;
 const uint32_t SCREEN_OFF_MS = 30000;
 
-bool     napping = false;
-uint32_t napStartMs = 0;
 uint32_t promptArrivedMs = 0;
 
 // Face-down = Z-axis dominant and negative. Debounced so a toss doesn't count.
@@ -230,40 +241,55 @@ static void applyReset(uint8_t idx) {
   ESP.restart();
 }
 
+// UI-scale constants — Waveshare 172x320 is ~1.27× wider and 1.33× taller
+// than the M5StickC Plus 135x240 the upstream layouts were tuned for.
+// Width gets a direct ~1.27× bump on the panels; height comes from
+// swapping the menus to the Cyrillic 8×13 font (= 33 % wider, 60 % taller
+// than the upstream 6×8 GLCD), so item line-spacing widens accordingly.
+const int MENU_W       = 160;
+const int MENU_LINE_H  = 18;
+const int MENU_PAD_TOP = 12;
+const int MENU_HINT_H  = 20;
+
 // Footer hint row inside a menu panel: "<downLbl> ↓  <rightLbl> →" with
-// pixel triangles. Panels add MENU_HINT_H to height and call this at bottom.
-const int MENU_HINT_H = 14;
+// pixel triangles. Panels add MENU_HINT_H to height and call this at
+// bottom. Default labels reflect the single-button mapping: tap to
+// navigate (↓), hold ~½s to confirm/page (→).
 static void drawMenuHints(const Palette& p, int mx, int mw, int hy,
-                          const char* downLbl = "A", const char* rightLbl = "B") {
+                          const char* downLbl = "tap", const char* rightLbl = "hold") {
   spr.drawFastHLine(mx + 6, hy - 4, mw - 12, p.textDim);
+  spr.setFont(&m5CyrillicFont());
+  spr.setTextSize(1);
   spr.setTextColor(p.textDim, PANEL);
-  // 6px/glyph at size 1; triangle goes 4px after the label ends
+  // 8 px/glyph monospace at the 8x13 Cyrillic font.
   int x = mx + 8;
   spr.setCursor(x, hy); spr.print(downLbl);
-  x += strlen(downLbl) * 6 + 4;
-  spr.fillTriangle(x, hy + 1, x + 6, hy + 1, x + 3, hy + 6, p.textDim);
+  x += strlen(downLbl) * 8 + 4;
+  spr.fillTriangle(x, hy + 2, x + 8, hy + 2, x + 4, hy + 9, p.textDim);
   x = mx + mw / 2 + 4;
   spr.setCursor(x, hy); spr.print(rightLbl);
-  x += strlen(rightLbl) * 6 + 4;
-  spr.fillTriangle(x, hy, x, hy + 6, x + 5, hy + 3, p.textDim);
+  x += strlen(rightLbl) * 8 + 4;
+  spr.fillTriangle(x, hy, x, hy + 9, x + 7, hy + 4, p.textDim);
+  spr.setFont(&fonts::Font0);
 }
 
 static void drawSettings() {
   const Palette& p = characterPalette();
-  int mw = 118, mh = 16 + SETTINGS_N * 14 + MENU_HINT_H;
+  int mw = MENU_W, mh = MENU_PAD_TOP * 2 + SETTINGS_N * MENU_LINE_H + MENU_HINT_H;
   int mx = (W - mw) / 2, my = (H - mh) / 2;
   spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
   spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
+  spr.setFont(&m5CyrillicFont());
   spr.setTextSize(1);
   Settings& s = settings();
   bool vals[] = { s.sound, s.bt, s.wifi, s.led, s.hud };
   for (int i = 0; i < SETTINGS_N; i++) {
     bool sel = (i == settingsSel);
     spr.setTextColor(sel ? p.text : p.textDim, PANEL);
-    spr.setCursor(mx + 6, my + 8 + i * 14);
+    spr.setCursor(mx + 6, my + MENU_PAD_TOP + i * MENU_LINE_H);
     spr.print(sel ? "> " : "  ");
     spr.print(settingsItems[i]);
-    spr.setCursor(mx + mw - 36, my + 8 + i * 14);
+    spr.setCursor(mx + mw - 42, my + MENU_PAD_TOP + i * MENU_LINE_H);
     spr.setTextColor(p.textDim, PANEL);
     if (i == 0) {
       spr.printf("%u/4", brightLevel);
@@ -279,27 +305,30 @@ static void drawSettings() {
       spr.printf("%u/%u", pos, total);
     }
   }
-  drawMenuHints(p, mx, mw, my + mh - 12, "Next", "Change");
+  spr.setFont(&fonts::Font0);
+  drawMenuHints(p, mx, mw, my + mh - 14, "Next", "Change");
 }
 
 static void drawReset() {
   const Palette& p = characterPalette();
-  int mw = 118, mh = 16 + RESET_N * 14 + MENU_HINT_H;
+  int mw = MENU_W, mh = MENU_PAD_TOP * 2 + RESET_N * MENU_LINE_H + MENU_HINT_H;
   int mx = (W - mw) / 2, my = (H - mh) / 2;
   spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
   spr.drawRoundRect(mx, my, mw, mh, 4, HOT);
+  spr.setFont(&m5CyrillicFont());
   spr.setTextSize(1);
   for (int i = 0; i < RESET_N; i++) {
     bool sel = (i == resetSel);
     spr.setTextColor(sel ? p.text : p.textDim, PANEL);
-    spr.setCursor(mx + 6, my + 8 + i * 14);
+    spr.setCursor(mx + 6, my + MENU_PAD_TOP + i * MENU_LINE_H);
     spr.print(sel ? "> " : "  ");
     bool armed = (i == resetConfirmIdx) &&
                  (int32_t)(millis() - resetConfirmUntil) < 0;
     if (armed) spr.setTextColor(HOT, PANEL);
     spr.print(armed ? "really?" : resetItems[i]);
   }
-  drawMenuHints(p, mx, mw, my + mh - 12);
+  spr.setFont(&fonts::Font0);
+  drawMenuHints(p, mx, mw, my + mh - 14);
 }
 
 void menuConfirm() {
@@ -321,20 +350,22 @@ void menuConfirm() {
 
 void drawMenu() {
   const Palette& p = characterPalette();
-  int mw = 118, mh = 16 + MENU_N * 14 + MENU_HINT_H;
+  int mw = MENU_W, mh = MENU_PAD_TOP * 2 + MENU_N * MENU_LINE_H + MENU_HINT_H;
   int mx = (W - mw) / 2, my = (H - mh) / 2;
   spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
   spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
+  spr.setFont(&m5CyrillicFont());
   spr.setTextSize(1);
   for (int i = 0; i < MENU_N; i++) {
     bool sel = (i == menuSel);
     spr.setTextColor(sel ? p.text : p.textDim, PANEL);
-    spr.setCursor(mx + 6, my + 8 + i * 14);
+    spr.setCursor(mx + 6, my + MENU_PAD_TOP + i * MENU_LINE_H);
     spr.print(sel ? "> " : "  ");
     spr.print(menuItems[i]);
     if (i == 4) spr.print(dataDemo() ? "  on" : "  off");
   }
-  drawMenuHints(p, mx, mw, my + mh - 12);
+  spr.setFont(&fonts::Font0);
+  drawMenuHints(p, mx, mw, my + mh - 14);
 }
 
 // Clock orientation: gravity along the in-plane X axis means the stick is
@@ -422,9 +453,12 @@ static void drawClock() {
     // via peek mode. Clearing from 90 leaves both untouched.
     spr.fillRect(0, 90, W, H - 90, p.bg);
     spr.setTextDatum(MC_DATUM);
-    spr.setTextSize(4); spr.setTextColor(p.text, p.bg);    spr.drawString(hm, CX, 140);
-    spr.setTextSize(2); spr.setTextColor(p.textDim, p.bg); spr.drawString(ss, CX, 175);
-    spr.setTextSize(1);                                     spr.drawString(dl, CX, 200);
+    // Sizes bumped one step (4→5, 2→3) and y positions stretched into the
+    // taller 320 px panel. HH:MM at size 5 = 5 chars × 30 px = 150 px,
+    // fits 172-wide screen with 11 px each side.
+    spr.setTextSize(5); spr.setTextColor(p.text, p.bg);    spr.drawString(hm, CX, 180);
+    spr.setTextSize(3); spr.setTextColor(p.textDim, p.bg); spr.drawString(ss, CX, 224);
+    spr.setTextSize(1);                                     spr.drawString(dl, CX, 250);
     spr.setTextDatum(TL_DATUM);
     return;
   }
@@ -479,8 +513,10 @@ static void drawClock() {
 PersonaState derive(const TamaState& s) {
   if (!s.connected)            return P_IDLE;
   if (s.sessionsWaiting > 0)   return P_ATTENTION;
-  if (s.recentlyCompleted)     return P_CELEBRATE;
   if (s.sessionsRunning >= 3)  return P_BUSY;
+  // recentlyCompleted → P_HEART one-shot, fired by edge-detect in loop().
+  // CELEBRATE stays reserved for level-up, so it reads as a rarer milestone
+  // than every Claude turn ending.
   return P_IDLE;   // connected, 0+ sessions, nothing urgent — hang out
 }
 
@@ -508,11 +544,11 @@ static void _infoHeader(const Palette& p, int& y, const char* section, uint8_t p
   spr.setTextColor(p.text, p.bg);
   spr.setCursor(4, y); spr.print("Info");
   spr.setTextColor(p.textDim, p.bg);
-  spr.setCursor(W - 28, y); spr.printf("%u/%u", page + 1, INFO_PAGES);
-  y += 12;
+  spr.setCursor(W - 36, y); spr.printf("%u/%u", page + 1, INFO_PAGES);
+  y += 16;
   spr.setTextColor(p.body, p.bg);
   spr.setCursor(4, y); spr.print(section);
-  y += 12;
+  y += 16;
 }
 
 void drawPasskey() {
@@ -533,46 +569,54 @@ void drawInfo() {
   const Palette& p = characterPalette();
   const int TOP = 70;
   spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setFont(&m5CyrillicFont());
   spr.setTextSize(1);
   int y = TOP + 2;
   auto ln = [&](const char* fmt, ...) {
-    char b[32]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof(b), fmt, a); va_end(a);
-    spr.setCursor(4, y); spr.print(b); y += 8;
+    char b[40]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof(b), fmt, a); va_end(a);
+    spr.setCursor(4, y); spr.print(b); y += 14;
   };
 
   if (infoPage == 0) {
+    // ABOUT is a wall of body text — swap to the small (6x12) Cyrillic
+    // font so every paragraph fits on screen without scrolling, and
+    // shrink line spacing to match.
+    spr.setFont(&m5CyrillicFontSmall());
+    auto lnSmall = [&](const char* s) {
+      spr.setCursor(4, y); spr.print(s); y += 12;
+    };
     _infoHeader(p, y, "ABOUT", infoPage);
     spr.setTextColor(p.textDim, p.bg);
-    ln("I watch your Claude");
-    ln("desktop sessions.");
-    y += 6;
-    ln("I sleep when nothing's");
-    ln("happening, wake when");
-    ln("you start working,");
-    ln("get impatient when");
-    ln("approvals pile up.");
-    y += 6;
+    lnSmall("I watch your Claude");
+    lnSmall("desktop sessions.");
+    y += 4;
+    lnSmall("I sleep when nothing's");
+    lnSmall("happening, wake when");
+    lnSmall("you start working,");
+    lnSmall("get impatient when");
+    lnSmall("approvals pile up.");
+    y += 4;
     spr.setTextColor(p.text, p.bg);
-    ln("Press A on a prompt");
-    ln("to approve from here.");
-    y += 6;
+    lnSmall("Tap the Left button");
+    lnSmall("on a prompt to approve.");
+    y += 4;
     spr.setTextColor(p.textDim, p.bg);
-    ln("18 species. Settings");
-    ln("> ascii pet to cycle.");
+    lnSmall("18 species. Settings");
+    lnSmall("> ascii pet to cycle.");
+    spr.setFont(&m5CyrillicFont());   // restore big font for header style
 
   } else if (infoPage == 1) {
-    _infoHeader(p, y, "BUTTONS", infoPage);
-    spr.setTextColor(p.text, p.bg);    ln("A   front");
+    _infoHeader(p, y, "Left Button", infoPage);
+    spr.setTextColor(p.text, p.bg);    ln("tap");
     spr.setTextColor(p.textDim, p.bg); ln("    next screen");
     ln("    approve prompt"); y += 4;
-    spr.setTextColor(p.text, p.bg);    ln("B   right side");
-    spr.setTextColor(p.textDim, p.bg); ln("    next page");
+    spr.setTextColor(p.text, p.bg);    ln("hold ~0.5s");
+    spr.setTextColor(p.textDim, p.bg); ln("    page / scroll");
     ln("    deny prompt"); y += 4;
-    spr.setTextColor(p.text, p.bg);    ln("hold A");
-    spr.setTextColor(p.textDim, p.bg); ln("    menu"); y += 4;
-    spr.setTextColor(p.text, p.bg);    ln("Power  left side");
-    spr.setTextColor(p.textDim, p.bg); ln("    tap = screen off");
-    ln("    hold 6s = off");
+    spr.setTextColor(p.text, p.bg);    ln("double-tap");
+    spr.setTextColor(p.textDim, p.bg); ln("    open menu"); y += 4;
+    spr.setTextColor(p.text, p.bg);    ln("Right Button");
+    spr.setTextColor(p.textDim, p.bg); ln("    reboots the chip");
 
   } else if (infoPage == 2) {
     _infoHeader(p, y, "CLAUDE", infoPage);
@@ -602,15 +646,16 @@ void drawInfo() {
     bool charging = usb && iBat_mA > 1;
     bool full = usb && vBat_mV > 4100 && iBat_mA < 10;
 
+    // 8x13 Cyrillic font already reads as a "big" header at size 1 —
+    // bumping it to 2 (16x26) was sized for the smaller 6x8 default and
+    // now looks oversized.
     spr.setTextColor(p.text, p.bg);
-    spr.setTextSize(2);
     spr.setCursor(4, y);
     spr.printf("%d%%", pct);
-    spr.setTextSize(1);
     spr.setTextColor(full ? GREEN : (charging ? HOT : p.textDim), p.bg);
-    spr.setCursor(60, y + 4);
+    spr.setCursor(48, y);
     spr.print(full ? "full" : (charging ? "charging" : (usb ? "usb" : "battery")));
-    y += 20;
+    y += 16;
 
     spr.setTextColor(p.textDim, p.bg);
     ln("  battery  %d.%02dV", vBat_mV/1000, (vBat_mV%1000)/10);
@@ -633,12 +678,12 @@ void drawInfo() {
     _infoHeader(p, y, "BLUETOOTH", infoPage);
     bool linked = settings().bt && dataBtActive();
 
+    // 8x13 reads as a header at size 1 — size 2 was for the upstream
+    // 6x8 default and now over-fills the row.
     spr.setTextColor(linked ? GREEN : (settings().bt ? HOT : p.textDim), p.bg);
-    spr.setTextSize(2);
     spr.setCursor(4, y);
     spr.print(linked ? "linked" : (settings().bt ? "discover" : "off"));
-    spr.setTextSize(1);
-    y += 20;
+    y += 16;
 
     spr.setTextColor(p.textDim, p.bg);
     spr.setTextColor(p.text, p.bg);
@@ -671,6 +716,12 @@ void drawInfo() {
     y += 4;
     spr.setTextColor(p.text, p.bg);
     ln("Felix Rieseberg");
+    y += 8;
+    spr.setTextColor(p.textDim, p.bg);
+    ln("build by");
+    y += 4;
+    spr.setTextColor(p.text, p.bg);
+    ln("Vladyslav Kovalenko");
     y += 12;
     spr.setTextColor(p.textDim, p.bg);
     ln("source");
@@ -682,170 +733,247 @@ void drawInfo() {
     spr.setTextColor(p.textDim, p.bg);
     ln("hardware");
     y += 4;
-    ln("M5StickC Plus");
-    ln("ESP32 + AXP192");
+    ln("Waveshare");
+    ln("ESP32-C6-LCD-1.47");
   }
+  spr.setFont(&fonts::Font0);
 }
 
 
 // Greedy word-wrap into fixed-width rows. Continuation rows get a leading
 // space. Returns number of rows written.
-static uint8_t wrapInto(const char* in, char out[][24], uint8_t maxRows, uint8_t width) {
-  uint8_t row = 0, col = 0;
-  const char* p = in;
+//
+// `width` is measured in codepoints (visible glyphs), not bytes — every
+// Cyrillic letter is 2 UTF-8 bytes, so the upstream byte-counted version
+// wrapped Russian text at half the visible width and put one word per
+// row. The buffer (`out[row]`) is still indexed by bytes, so the
+// algorithm tracks both counts in parallel.
+static uint8_t wrapInto(const char* in, char out[][64], uint8_t maxRows, uint8_t width) {
+  auto cp_count = [](const char* s, const char* end) -> uint16_t {
+    uint16_t n = 0;
+    for (const char* q = s; q < end; q++) {
+      if ((*q & 0xC0) != 0x80) n++;          // skip UTF-8 continuation bytes
+    }
+    return n;
+  };
+
+  uint8_t row    = 0;
+  uint16_t colCp = 0;                          // glyphs already on this row
+  uint16_t colB  = 0;                          // bytes already on this row
+  const char* p  = in;
   while (*p && row < maxRows) {
-    while (*p == ' ') p++;                     // skip leading spaces
-    // measure next word
+    while (*p == ' ') p++;
     const char* w = p;
     while (*p && *p != ' ') p++;
-    uint8_t wlen = p - w;
-    if (wlen == 0) break;
-    uint8_t need = (col > 0 ? 1 : 0) + wlen;
-    if (col + need > width) {
-      out[row][col] = 0;
+    uint16_t wlenB  = (uint16_t)(p - w);
+    if (wlenB == 0) break;
+    uint16_t wlenCp = cp_count(w, p);
+    uint16_t needCp = (colCp > 0 ? 1 : 0) + wlenCp;
+    if (colCp + needCp > width) {
+      out[row][colB] = 0;
       if (++row >= maxRows) return row;
-      out[row][0] = ' '; col = 1;              // continuation indent
+      out[row][0] = ' ';
+      colB = 1; colCp = 1;                     // continuation indent
     }
-    if (col > 1 || (col == 1 && out[row][0] != ' ')) out[row][col++] = ' ';
-    else if (col == 1 && row > 0) {}           // already have the indent space
-    // hard-break words that still don't fit
-    while (wlen > width - col) {
-      uint8_t take = width - col;
-      memcpy(&out[row][col], w, take); col += take; w += take; wlen -= take;
-      out[row][col] = 0;
+    if (colB > 1 || (colB == 1 && out[row][0] != ' ')) {
+      out[row][colB++] = ' ';
+      colCp++;
+    } else if (colB == 1 && row > 0) {
+      // indent space already accounted for
+    }
+    // Hard-break overlong words across rows — same shape as upstream but
+    // step a codepoint at a time so we don't slice a multi-byte glyph.
+    while (wlenCp > width - colCp) {
+      uint16_t takeCp = width - colCp;
+      const char* q = w;
+      while (takeCp > 0 && (size_t)(q - w) < wlenB) {
+        do { q++; } while (q < w + wlenB && (*q & 0xC0) == 0x80);
+        takeCp--;
+      }
+      uint16_t takeB = (uint16_t)(q - w);
+      memcpy(&out[row][colB], w, takeB);
+      colB  += takeB;
+      colCp += (width - colCp);
+      w     += takeB;
+      wlenB -= takeB;
+      wlenCp = cp_count(w, w + wlenB);
+      out[row][colB] = 0;
       if (++row >= maxRows) return row;
-      out[row][0] = ' '; col = 1;
+      out[row][0] = ' ';
+      colB = 1; colCp = 1;
     }
-    memcpy(&out[row][col], w, wlen); col += wlen;
+    memcpy(&out[row][colB], w, wlenB);
+    colB  += wlenB;
+    colCp += wlenCp;
   }
-  if (col > 0 && row < maxRows) { out[row][col] = 0; row++; }
+  if (colB > 0 && row < maxRows) {
+    out[row][colB] = 0;
+    row++;
+  }
   return row;
 }
 
 static void drawApproval() {
   const Palette& p = characterPalette();
-  const int AREA = 78;
+  // Approval area grew from 78 to 110 px to match the 8x13 Cyrillic font
+  // we now use everywhere — five rows at 14 px line height + a 4 px top
+  // margin + 16 px for the bottom hint row.
+  const int AREA = 110;
   spr.fillRect(0, H - AREA, W, AREA, p.bg);
   spr.drawFastHLine(0, H - AREA, W, p.textDim);
 
+  spr.setFont(&m5CyrillicFont());
   spr.setTextSize(1);
   spr.setTextColor(p.textDim, p.bg);
-  spr.setCursor(4, H - AREA + 4);
+  spr.setCursor(6, H - AREA + 6);
   uint32_t waited = (millis() - promptArrivedMs) / 1000;
   if (waited >= 10) spr.setTextColor(HOT, p.bg);
   spr.printf("approve? %lus", (unsigned long)waited);
 
-  // Size 2 only if it fits one line (~10 chars at 12px on 135px screen)
+  // Tool name in size 2 only if it'd still fit; native 8x13 is already
+  // big enough that ≥10 chars usually overflow at 2× (16 px → 160 px).
   int toolLen = strlen(tama.promptTool);
   spr.setTextColor(p.text, p.bg);
-  spr.setTextSize(toolLen <= 10 ? 2 : 1);
-  spr.setCursor(4, H - AREA + (toolLen <= 10 ? 14 : 18));
+  spr.setTextSize(toolLen <= 8 ? 2 : 1);
+  spr.setCursor(6, H - AREA + 22);
   spr.print(tama.promptTool);
   spr.setTextSize(1);
 
-  // Hint wraps at ~21 chars to two lines under the tool name
+  // Hint wraps at ~20 chars (172 / 8 = 21 max) to two rows under the tool.
   spr.setTextColor(p.textDim, p.bg);
   int hlen = strlen(tama.promptHint);
-  spr.setCursor(4, H - AREA + 34);
-  spr.printf("%.21s", tama.promptHint);
-  if (hlen > 21) {
-    spr.setCursor(4, H - AREA + 42);
-    spr.printf("%.21s", tama.promptHint + 21);
+  spr.setCursor(6, H - AREA + 56);
+  spr.printf("%.20s", tama.promptHint);
+  if (hlen > 20) {
+    spr.setCursor(6, H - AREA + 72);
+    spr.printf("%.20s", tama.promptHint + 20);
   }
 
   if (responseSent) {
     spr.setTextColor(p.textDim, p.bg);
-    spr.setCursor(4, H - 12);
+    spr.setCursor(8, H - 16);
     spr.print("sent...");
   } else {
+    // Indent away from the rounded corners. Left = approve via short tap,
+    // right = deny via long hold (matches our single-button decoder).
     spr.setTextColor(GREEN, p.bg);
-    spr.setCursor(4, H - 12);
-    spr.print("A: approve");
+    spr.setCursor(8, H - 16);
+    spr.print("tap: ok");
     spr.setTextColor(HOT, p.bg);
-    spr.setCursor(W - 48, H - 12);
-    spr.print("B: deny");
+    spr.setCursor(W - 88, H - 16);
+    spr.print("hold: deny");
   }
+  spr.setFont(&fonts::Font0);
 }
 
 static void tinyHeart(int x, int y, bool filled, uint16_t col) {
+  // Heart scaled up to ~12×8 (was 8×5) to match the bigger pet-stats
+  // layout below. Same shape, just denser pixels.
   if (filled) {
-    spr.fillCircle(x - 2, y, 2, col);
-    spr.fillCircle(x + 2, y, 2, col);
-    spr.fillTriangle(x - 4, y + 1, x + 4, y + 1, x, y + 5, col);
+    spr.fillCircle(x - 3, y, 3, col);
+    spr.fillCircle(x + 3, y, 3, col);
+    spr.fillTriangle(x - 6, y + 2, x + 6, y + 2, x, y + 8, col);
   } else {
-    spr.drawCircle(x - 2, y, 2, col);
-    spr.drawCircle(x + 2, y, 2, col);
-    spr.drawLine(x - 4, y + 1, x, y + 5, col);
-    spr.drawLine(x + 4, y + 1, x, y + 5, col);
+    spr.drawCircle(x - 3, y, 3, col);
+    spr.drawCircle(x + 3, y, 3, col);
+    spr.drawLine(x - 6, y + 2, x, y + 8, col);
+    spr.drawLine(x + 6, y + 2, x, y + 8, col);
   }
 }
 
 static void drawPetStats(const Palette& p) {
+  // Layout rebuilt for the full 172×320 panel — upstream coordinates
+  // crammed everything into the upper-left 135×180 of the M5StickC. All
+  // x positions get a ~1.3× horizontal stretch, line spacing grows with
+  // the 8×13 Cyrillic font, and graphics primitives are bumped one
+  // pixel up so they read at arm's length.
   const int TOP = 70;
   spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setFont(&m5CyrillicFont());
   spr.setTextSize(1);
-  int y = TOP + 16;
+  int y = TOP + 24;
 
   spr.setTextColor(p.textDim, p.bg);
-  spr.setCursor(6, y - 2); spr.print("mood");
+  spr.setCursor(8, y - 4); spr.print("mood");
   uint8_t mood = statsMoodTier();
   uint16_t moodCol = (mood >= 3) ? RED : (mood >= 2) ? HOT : p.textDim;
-  for (int i = 0; i < 4; i++) tinyHeart(54 + i * 16, y + 2, i < mood, moodCol);
+  for (int i = 0; i < 4; i++) tinyHeart(76 + i * 22, y + 2, i < mood, moodCol);
 
-  y += 20;
-  spr.setCursor(6, y - 2); spr.print("fed");
+  y += 24;
+  spr.setCursor(8, y - 4); spr.print("fed");
   uint8_t fed = statsFedProgress();
   for (int i = 0; i < 10; i++) {
-    int px = 38 + i * 9;
-    if (i < fed) spr.fillCircle(px, y + 1, 2, p.body);
-    else spr.drawCircle(px, y + 1, 2, p.textDim);
-  }
-
-  y += 20;
-  spr.setCursor(6, y - 2); spr.print("energy");
-  uint8_t en = statsEnergyTier();
-  uint16_t enCol = (en >= 4) ? 0x07FF : (en >= 2) ? 0xFFE0 : HOT;
-  for (int i = 0; i < 5; i++) {
-    int px = 54 + i * 13;
-    if (i < en) spr.fillRect(px, y - 2, 9, 6, enCol);
-    else spr.drawRect(px, y - 2, 9, 6, p.textDim);
+    int px = 56 + i * 12;
+    if (i < fed) spr.fillCircle(px, y + 1, 3, p.body);
+    else         spr.drawCircle(px, y + 1, 3, p.textDim);
   }
 
   y += 24;
-  spr.fillRoundRect(6, y - 2, 42, 14, 3, p.body);
-  spr.setTextColor(p.bg, p.body);
-  spr.setCursor(11, y + 1); spr.printf("Lv %u", stats().level);
+  spr.setCursor(8, y - 4); spr.print("energy");
+  uint8_t en = statsEnergyTier();
+  uint16_t enCol = (en >= 4) ? 0x07FF : (en >= 2) ? 0xFFE0 : HOT;
+  for (int i = 0; i < 5; i++) {
+    int px = 76 + i * 18;
+    if (i < en) spr.fillRect(px, y - 3, 14, 8, enCol);
+    else        spr.drawRect(px, y - 3, 14, 8, p.textDim);
+  }
 
-  y += 20;
+  y += 30;
+  spr.fillRoundRect(8, y - 4, 60, 20, 4, p.body);
+  spr.setTextColor(p.bg, p.body);
+  spr.setCursor(14, y - 1); spr.printf("Lv %u", stats().level);
+
+  y += 28;
   spr.setTextColor(p.textDim, p.bg);
-  spr.setCursor(6, y);
-  spr.printf("approved %u", stats().approvals);
-  spr.setCursor(6, y + 10);
-  spr.printf("denied   %u", stats().denials);
+
+  // EXP toward next level: progress through current 50K-token bucket.
+  // Bypass-permissions users have nothing on approved/denied so those rows
+  // get suppressed below — surface the actual progression signal here.
+  uint32_t exp = stats().tokens % TOKENS_PER_LEVEL;
+  spr.setCursor(8, y);
+  if (exp >= 1000) spr.printf("exp      %lu.%luK/%uK", exp/1000, (exp/100)%10, (unsigned)(TOKENS_PER_LEVEL/1000));
+  else             spr.printf("exp      %lu/%uK",     exp,                    (unsigned)(TOKENS_PER_LEVEL/1000));
+  y += 14;
+
+  if (stats().approvals > 0) {
+    spr.setCursor(8, y);
+    spr.printf("approved %u", stats().approvals);
+    y += 14;
+  }
+  if (stats().denials > 0) {
+    spr.setCursor(8, y);
+    spr.printf("denied   %u", stats().denials);
+    y += 14;
+  }
+
   uint32_t nap = stats().napSeconds;
-  spr.setCursor(6, y + 20);
+  spr.setCursor(8, y);
   spr.printf("napped   %luh%02lum", nap/3600, (nap/60)%60);
+  y += 14;
+
   auto tokFmt = [&](const char* label, uint32_t v, int yPx) {
-    spr.setCursor(6, yPx);
+    spr.setCursor(8, yPx);
     if (v >= 1000000)   spr.printf("%s%lu.%luM", label, v/1000000, (v/100000)%10);
-    else if (v >= 1000) spr.printf("%s%lu.%luK", label, v/1000, (v/100)%10);
-    else                spr.printf("%s%lu", label, v);
+    else if (v >= 1000) spr.printf("%s%lu.%luK", label, v/1000,    (v/100)%10);
+    else                spr.printf("%s%lu",      label, v);
   };
-  tokFmt("tokens   ", stats().tokens, y + 30);
-  tokFmt("today    ", tama.tokensToday, y + 40);
+  tokFmt("tokens   ", stats().tokens,   y); y += 14;
+  tokFmt("today    ", tama.tokensToday, y);
+  spr.setFont(&fonts::Font0);
 }
 
 static void drawPetHowTo(const Palette& p) {
   const int TOP = 70;
   spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setFont(&m5CyrillicFont());
   spr.setTextSize(1);
   int y = TOP + 2;
   auto ln = [&](uint16_t c, const char* s) {
-    spr.setTextColor(c, p.bg); spr.setCursor(6, y); spr.print(s); y += 9;
+    spr.setTextColor(c, p.bg); spr.setCursor(8, y); spr.print(s); y += 14;
   };
-  auto gap = [&]() { y += 4; };
+  auto gap = [&]() { y += 6; };
 
-  y += 12;  // room for the PET header drawn by drawPet()
+  y += 16;  // room for the PET header drawn by drawPet()
 
   ln(p.body,    "MOOD");
   ln(p.textDim, " approve fast = up");
@@ -855,15 +983,14 @@ static void drawPetHowTo(const Palette& p) {
   ln(p.textDim, " 50K tokens =");
   ln(p.textDim, " level up + confetti"); gap();
 
-  ln(p.body,    "ENERGY");
-  ln(p.textDim, " face-down to nap");
-  ln(p.textDim, " refills to full"); gap();
+  // No IMU on this board, so face-down nap never triggers — the upstream
+  // ENERGY mechanic is effectively static. Hide the row to avoid lying.
+  gap();
 
-  ln(p.textDim, "idle 30s = off");
-  ln(p.textDim, "any button = wake"); gap();
-
-  ln(p.textDim, "A: screens  B: page");
-  ln(p.textDim, "hold A: menu");
+  ln(p.textDim, "tap = next screen");
+  ln(p.textDim, "hold = page / deny");
+  ln(p.textDim, "double-tap = menu");
+  spr.setFont(&fonts::Font0);
 }
 
 void drawPet() {
@@ -874,65 +1001,84 @@ void drawPet() {
   else drawPetHowTo(p);
 
   // Header on top of whichever page drew — title left, counter right
+  // (use the same big Cyrillic font as the body for consistency).
+  spr.setFont(&m5CyrillicFont());
   spr.setTextSize(1);
   spr.setTextColor(p.text, p.bg);
-  spr.setCursor(4, y + 2);
+  spr.setCursor(8, y + 2);
   if (ownerName()[0]) {
     spr.printf("%s's %s", ownerName(), petName());
   } else {
     spr.print(petName());
   }
   spr.setTextColor(p.textDim, p.bg);
-  spr.setCursor(W - 28, y + 2);
+  spr.setCursor(W - 36, y + 2);
   spr.printf("%u/%u", petPage + 1, PET_PAGES);
+  spr.setFont(&fonts::Font0);
 }
 
 void drawHUD() {
   if (tama.promptId[0]) { drawApproval(); return; }
   const Palette& p = characterPalette();
-  const int SHOW = 3, LH = 8, WIDTH = 21;
+  // u8g2 8x13 monospace Cyrillic font. 172 px / 8 = 21 chars per row.
+  // LH bumped to 14 to keep a 1 px gap between rows at the new font
+  // height (13 px glyphs).
+  const int SHOW = 3, LH = 14, WIDTH = 20;
   const int AREA = SHOW * LH + 4;
   spr.fillRect(0, H - AREA, W, AREA, p.bg);
+  spr.setFont(&m5CyrillicFont());
   spr.setTextSize(1);
 
   if (tama.lineGen != lastLineGen) { msgScroll = 0; lastLineGen = tama.lineGen; wake(); }
 
-  if (tama.nLines == 0) {
-    spr.setTextColor(p.text, p.bg);
-    spr.setCursor(4, H - LH - 2);
-    spr.print(tama.msg);
-    return;
-  }
-
-  // Wrap all transcript lines into a flat display buffer. Track which
-  // transcript index each display row came from, so we can dim older ones.
-  static char disp[32][24];
+  // Wrap all transcript lines into a flat display buffer. When the desktop
+  // sent no entries but populated msg (e.g. a user-typed status the buddy
+  // briefly mirrors), fall back to wrapping msg through the same path so
+  // longer Cyrillic strings get rows instead of clipping off-screen.
+  static char disp[32][64];
   static uint8_t srcOf[32];
   uint8_t nDisp = 0;
-  for (uint8_t i = 0; i < tama.nLines && nDisp < 32; i++) {
-    uint8_t got = wrapInto(tama.lines[i], &disp[nDisp], 32 - nDisp, WIDTH);
-    for (uint8_t j = 0; j < got; j++) srcOf[nDisp + j] = i;
-    nDisp += got;
+  uint8_t nLines = tama.nLines;
+  if (nLines == 0) {
+    nDisp = wrapInto(tama.msg, disp, 32, WIDTH);
+    for (uint8_t j = 0; j < nDisp; j++) srcOf[j] = 0;
+    nLines = nDisp > 0 ? 1 : 0;
+  } else {
+    for (uint8_t i = 0; i < tama.nLines && nDisp < 32; i++) {
+      uint8_t got = wrapInto(tama.lines[i], &disp[nDisp], 32 - nDisp, WIDTH);
+      for (uint8_t j = 0; j < got; j++) srcOf[nDisp + j] = i;
+      nDisp += got;
+    }
   }
+  if (nDisp == 0) { spr.setFont(&fonts::Font0); return; }
 
   uint8_t maxBack = (nDisp > SHOW) ? (nDisp - SHOW) : 0;
   if (msgScroll > maxBack) msgScroll = maxBack;
 
   int end = (int)nDisp - msgScroll;
   int start = end - SHOW; if (start < 0) start = 0;
-  uint8_t newest = tama.nLines - 1;
+  // `nLines` is the local source-line count (== 1 when we synthesized rows
+  // from msg). Using tama.nLines directly here would underflow to 0xFF
+  // when there were no real entries and dim the msg rows.
+  uint8_t newest = nLines - 1;
+  // Center every transcript row on X — the rounded bottom-left/right
+  // corners clip the first/last glyph of any left-aligned line, and the
+  // entries the desktop sends ("(called Read)", "(called Edit)", short
+  // status lines) all fit centered without wrapping.
+  spr.setTextDatum(MC_DATUM);
   for (int i = 0; start + i < end; i++) {
     uint8_t row = start + i;
     bool fresh = (srcOf[row] == newest) && (msgScroll == 0);
     spr.setTextColor(fresh ? p.text : p.textDim, p.bg);
-    spr.setCursor(4, H - AREA + 2 + i * LH);
-    spr.print(disp[row]);
+    spr.drawString(disp[row], W / 2, H - AREA + 2 + i * LH + LH / 2);
   }
+  spr.setTextDatum(TL_DATUM);
   if (msgScroll > 0) {
     spr.setTextColor(p.body, p.bg);
-    spr.setCursor(W - 18, H - LH - 2);
+    spr.setCursor(W - 24, H - LH - 2);
     spr.printf("-%u", msgScroll);
   }
+  spr.setFont(&fonts::Font0);   // restore default for the next drawer
 }
 
 void setup() {
@@ -941,8 +1087,7 @@ void setup() {
   M5.Imu.Init();
   M5.Beep.begin();
   startBt();
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);   // off
+  if (LED_PIN >= 0) { pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, HIGH); }
   applyBrightness();
   lastInteractMs = millis();
   statsLoad();
@@ -954,6 +1099,15 @@ void setup() {
   spr.createSprite(W, H);
   characterInit(nullptr);  // scan /characters/ for whatever is installed
   gifAvailable = characterLoaded();
+
+  // WiFi: read /config/wifi.json, scan, connect to strongest saved AP.
+  // Non-blocking — wifiLinkTick() drives the state machine from loop().
+  wifiLinkInit();
+
+  // OTA: poll GitHub Releases for newer firmware. First check is delayed
+  // 30s after boot so WiFi has a chance to associate; subsequent checks
+  // run hourly. Manual trigger via {"cmd":"ota"}.
+  otaInit();
   // species NVS: 0..N-1 = ASCII species, 0xFF = use GIF (also the default,
   // so a fresh install lands on the GIF). With no GIF installed, 0xFF falls
   // through to buddyInit()'s clamped default.
@@ -992,6 +1146,26 @@ void loop() {
   uint32_t now = millis();
 
   dataPoll(&tama);
+  wifiLinkTick();
+  otaTick();
+
+  // Feed the mood-activity ring on every transcript bump — proxies "Claude
+  // is talking to me" when there are no approvals to time.
+  static uint16_t prevLineGenStats = 0;
+  if (tama.lineGen != prevLineGenStats) {
+    statsOnLineGen();
+    prevLineGenStats = tama.lineGen;
+  }
+
+  // Edge-detect Claude finishing a turn: fire P_HEART once on the rising
+  // edge of recentlyCompleted. The bridge holds the flag for a short
+  // window, so without edge detection HEART would re-trigger every loop.
+  static bool prevCompleted = false;
+  if (tama.recentlyCompleted && !prevCompleted) {
+    triggerOneShot(P_HEART, 2500);
+  }
+  prevCompleted = tama.recentlyCompleted;
+
   if (statsPollLevelUp()) triggerOneShot(P_CELEBRATE, 3000);
   baseState = derive(tama);
 
@@ -1001,12 +1175,98 @@ void loop() {
 
   if ((int32_t)(now - oneShotUntil) >= 0) activeState = baseState;
 
-  // LED: pulse on attention, otherwise off
-  if (activeState == P_ATTENTION && settings().led) {
-    digitalWrite(LED_PIN, (now / 400) % 2 ? LOW : HIGH);
-  } else {
-    digitalWrite(LED_PIN, HIGH);
+  // Persona-state LED. The Waveshare board has one WS2812 (vs. the
+  // M5StickC's single red LED), so each persona state gets a distinct
+  // color/pattern instead of just on-or-off — useful peripheral cue when
+  // the screen is out of sight.
+  //
+  //   sleep      off (don't disturb)
+  //   idle       off (resting; the screen says it all)
+  //   busy       amber slow breathe (Claude is working)
+  //   attention  red fast blink (approval waiting — same urgency the
+  //              upstream LED conveyed)
+  //   celebrate  rainbow cycle (level up)
+  //   dizzy      purple flicker
+  //   heart      soft pink steady (responsive-approval thank-you)
+  uint8_t lr = 0, lg = 0, lb = 0;
+  if (settings().led) {
+    auto triBreathe = [](uint32_t period_ms, uint32_t t) -> uint8_t {
+      // 0 → 255 → 0 triangle over `period_ms`. Cheaper than sinf and
+      // perceptually close enough on a single dim NeoPixel.
+      uint32_t phase = t % period_ms;
+      uint32_t half = period_ms / 2;
+      return phase < half ? (phase * 255 / half) : (255 - (phase - half) * 255 / half);
+    };
+    switch (activeState) {
+      case P_BUSY: {
+        uint8_t a = triBreathe(1600, now);
+        lr = (uint16_t)a * 255 / 255;          // amber: full red,
+        lg = (uint16_t)a *  80 / 255;          //        third green,
+        lb = 0;                                //        no blue
+        break;
+      }
+      case P_ATTENTION: {
+        bool on = (now / 400) % 2;
+        lr = on ? 0xFF : 0;
+        break;
+      }
+      case P_CELEBRATE: {
+        // 6-segment hue cycle — three primaries + three secondaries, 1 s
+        // per segment. Wraps the rainbow without an HSV→RGB conversion.
+        static const uint8_t WHEEL[6][3] = {
+          {255,   0,   0}, {255, 165,   0}, {255, 255,   0},
+          {  0, 255,   0}, {  0,   0, 255}, {180,   0, 255},
+        };
+        uint8_t i = (now / 200) % 6;
+        lr = WHEEL[i][0]; lg = WHEEL[i][1]; lb = WHEEL[i][2];
+        break;
+      }
+      case P_DIZZY: {
+        bool on = (now / 90) % 2;             // ~5 Hz flicker
+        lr = on ? 180 : 60;
+        lb = on ? 255 : 80;
+        break;
+      }
+      case P_HEART: {
+        lr = 255; lg = 60; lb = 100;          // dim pink, no animation
+        break;
+      }
+      case P_SLEEP:
+      case P_IDLE:
+      default:
+        break;                                 // off
+    }
   }
+
+  // Status-update pulse: when `tama.lineGen` ticks (the desktop sent a
+  // new transcript line / msg), overlay a 1 s blue triangle fade on top
+  // of whatever the persona-state palette decided. Doesn't replace the
+  // attention blink — that still pokes through on the next cycle.
+  static uint16_t prevLineGenLed = 0;
+  static uint32_t statusPulseStartMs = 0;
+  if (settings().led && tama.lineGen != prevLineGenLed) {
+    statusPulseStartMs = now ? now : 1;       // 0 means "no pulse"
+    prevLineGenLed = tama.lineGen;
+  }
+  if (statusPulseStartMs) {
+    uint32_t elapsed = now - statusPulseStartMs;
+    const uint32_t pulseDur = 1000;
+    if (elapsed >= pulseDur) {
+      statusPulseStartMs = 0;
+    } else {
+      uint32_t half = pulseDur / 2;
+      uint8_t blueB = elapsed < half
+        ? (uint8_t)(elapsed * 255 / half)
+        : (uint8_t)(255 - (elapsed - half) * 255 / half);
+      // Override the persona color while pulsing — clearer "something
+      // happened" cue than blending with red attention etc.
+      lr = 0;
+      lg = 0;
+      lb = blueB;
+    }
+  }
+
+  M5.Beep.setLed(lr, lg, lb);
 
   // shake → dizzy + force scenario advance
   if (now - lastShakeCheck > 50) {
@@ -1147,9 +1407,25 @@ void loop() {
   clockRefreshRtc();   // 1Hz internal throttle; also caches _onUsb
   // Show the clock when nothing is happening — bridge heartbeat alone
   // doesn't count as activity (it's the only way to get the RTC synced).
+  // Show the clock face only after CLOCK_IDLE_MS of nothing happening
+  // (no sessions, no prompt, no recent transcript change, no buttons).
+  // Button activity counts so pressing the Left button dismisses an
+  // already-shown clock back to the buddy/HUD view and starts the timer
+  // fresh.
+  static const uint32_t CLOCK_IDLE_MS = 60000;
+  static uint32_t lastActiveMs = 0;
+  static uint16_t prevLineGen  = 0;
+  bool buttonActivity = M5.BtnA.isPressed() || M5.BtnB.isPressed();
+  if (tama.sessionsRunning > 0 || tama.sessionsWaiting > 0 || tama.promptId[0]
+      || tama.lineGen != prevLineGen || buttonActivity) {
+    lastActiveMs = now;
+  }
+  prevLineGen = tama.lineGen;
+  bool idleEnough = (uint32_t)(now - lastActiveMs) >= CLOCK_IDLE_MS;
   bool clocking = displayMode == DISP_NORMAL
                && !menuOpen && !settingsOpen && !resetOpen && !inPrompt
                && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
+               && idleEnough
                && dataRtcValid() && _onUsb;
   if (clocking) clockUpdateOrient();
   else { clockOrient = 0; orientFrames = 0; paintedOrient = 0; }
@@ -1185,8 +1461,38 @@ void loop() {
   if (pk && !lastPasskey) { wake(); beep(1800, 60); }
   lastPasskey = pk;
 
-  if (napping || screenOff || landscapeClock) {
-    // skip sprite render — face-down, powered off, or landscape clock
+  // ---- Architectural full-clear on layer transitions ----
+  // Each drawer paints into its own sub-region and trusts whatever was
+  // there before to either stay (pet on top) or be overwritten. That
+  // breaks when a *larger* surface (passkey, approval, clock) yields to
+  // a *smaller* one (HUD): the leftover pixels of the bigger surface
+  // sit there with nothing to overwrite them. Track a fingerprint of
+  // every visible layer this frame; whenever it changes, wipe the
+  // sprite and force the pet/character to repaint from scratch. Pet/
+  // GIF code is event-gated, so we invalidate them too — otherwise
+  // they'd render only on their next animation tick.
+  uint32_t frameSig = 0;
+  frameSig |= ((uint32_t)displayMode & 0x3) << 0;
+  frameSig |= (uint32_t)(menuOpen     ? 1 : 0) << 2;
+  frameSig |= (uint32_t)(settingsOpen ? 1 : 0) << 3;
+  frameSig |= (uint32_t)(resetOpen    ? 1 : 0) << 4;
+  frameSig |= (uint32_t)(inPrompt     ? 1 : 0) << 5;
+  frameSig |= (uint32_t)(clocking     ? 1 : 0) << 6;
+  frameSig |= (uint32_t)(landscapeClock ? 1 : 0) << 7;
+  frameSig |= (uint32_t)(pk ? 1 : 0) << 8;
+  frameSig |= (uint32_t)(responseSent ? 1 : 0) << 9;
+  frameSig |= (uint32_t)(statsIsNapping() ? 1 : 0) << 10;
+  frameSig |= (uint32_t)(screenOff ? 1 : 0) << 11;
+  static uint32_t lastFrameSig = 0xFFFFFFFF;
+  if (frameSig != lastFrameSig) {
+    spr.fillSprite(characterPalette().bg);
+    characterInvalidate();
+    if (buddyMode) buddyInvalidate();
+    lastFrameSig = frameSig;
+  }
+
+  if (statsIsNapping() || screenOff || landscapeClock) {
+    // skip sprite render — napping (idle), powered off, or landscape clock
     // (which draws direct-to-LCD below)
   } else if (buddyMode) {
     buddyTick(activeState);
@@ -1217,7 +1523,7 @@ void loop() {
   }
   if (landscapeClock) {
     drawClock();
-  } else if (!napping && !screenOff) {
+  } else if (!statsIsNapping() && !screenOff) {
     if (blePasskey()) drawPasskey();
     else if (clocking) drawClock();
     else if (displayMode == DISP_INFO) drawInfo();
@@ -1229,26 +1535,22 @@ void loop() {
     spr.pushSprite(0, 0);
   }
 
-  // Face-down nap: dim immediately, pause animations, accumulate sleep time.
-  // Skipped during approval — you're holding it to read, not sleeping it.
-  // Exit needs sustained not-down so IMU noise at the threshold doesn't
-  // bounce brightness between 8 and full every few frames.
-  static int8_t faceDownFrames = 0;
-  if (!inPrompt) {
-    bool down = isFaceDown();
-    if (down)       { if (faceDownFrames < 20) faceDownFrames++; }
-    else            { if (faceDownFrames > -10) faceDownFrames--; }
-  }
-
-  if (!napping && faceDownFrames >= 15) {
-    napping = true;
-    napStartMs = now;
+  // Idle-based nap: no IMU on this board, so the old face-down detector is
+  // gone. Instead nap when nothing's happening for IDLE_NAP_MS — reuses
+  // lastActiveMs from the clock-mode block above (already tracks sessions,
+  // prompts, transcript ticks, button activity). Skipped during approval.
+  // Skipped also until first observed activity, so a fresh boot waits for
+  // a real signal before the pet starts napping.
+  static const uint32_t IDLE_NAP_MS = 5UL * 60 * 1000;
+  bool restingNow = !inPrompt
+                 && lastActiveMs > 0
+                 && (uint32_t)(now - lastActiveMs) >= IDLE_NAP_MS;
+  if (!statsIsNapping() && restingNow) {
+    statsBeginNap();
     M5.Axp.ScreenBreath(8);
     dimmed = true;
-  } else if (napping && faceDownFrames <= -8) {
-    napping = false;
-    statsOnNapEnd((now - napStartMs) / 1000);
-    statsOnWake();
+  } else if (statsIsNapping() && !restingNow) {
+    statsEndNap();
     wake();
   }
 

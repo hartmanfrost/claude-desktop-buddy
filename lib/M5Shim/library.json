@@ -1,0 +1,11 @@
+{
+  "name": "M5Shim",
+  "version": "0.1.0",
+  "description": "Drop-in M5StickCPlus compatibility layer for the Waveshare ESP32-C6-LCD-1.47 board. Provides M5.Lcd / Imu / Axp / Rtc / Beep / BtnA / BtnB on top of LovyanGFX + Arduino primitives.",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": [
+    {"name": "LovyanGFX"},
+    {"name": "Adafruit NeoPixel"}
+  ]
+}

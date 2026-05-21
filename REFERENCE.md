@@ -222,3 +222,95 @@ nothing you'd mind overwritten.
 The BLE API is only available when the desktop apps are in developer mode
 (**Help → Troubleshooting → Enable Developer Mode**). It's intended for
 makers and developers and isn't an officially supported product feature.
+
+---
+
+# Fork extensions (Waveshare ESP32-C6 build)
+
+The commands below are **not part of the upstream protocol** — they're
+implemented in this fork's firmware and only respond on devices flashed
+from this branch. The desktop app doesn't send them on its own, so use a
+custom BLE client (nRF Connect, Web Bluetooth, [`scripts/wifi-push-ble.py`](scripts/wifi-push-ble.py))
+or USB-Serial directly.
+
+## WiFi credentials (`cmd:"wifi"`)
+
+The device stores up to 8 SSID/PSK pairs in `/config/wifi.json` on
+LittleFS and runs a station that reconnects to the strongest saved
+network.
+
+| Payload | Effect |
+| --- | --- |
+| `{"cmd":"wifi","ssid":"Home","psk":"abc"}` | add or update by SSID |
+| `{"cmd":"wifi","ssid":"Home","action":"remove"}` | remove by SSID |
+| `{"cmd":"wifi","action":"list"}` | returns `{"ack":"wifi","action":"list","ssids":[…]}` (no PSKs) |
+| `{"cmd":"wifi","action":"clear"}` | wipe all |
+| `{"cmd":"wifi","nets":[{"ssid":"…","psk":"…"},…]}` | replace entire list |
+
+Acks: `{"ack":"wifi","ok":true,"n":<count>}` where `n` is the stored
+count for bulk operations.
+
+**Folder-push alternative.** A folder containing `wifi.json` with the
+schema below can be dropped on the Hardware Buddy window — the file is
+routed to `/config/wifi.json` without touching the installed character.
+
+```json
+{ "nets": [
+    {"ssid": "Home", "psk": "secretA"},
+    {"ssid": "Work", "psk": "secretB"}
+  ]
+}
+```
+
+## OTA update (`cmd:"ota"`)
+
+Manually triggers an immediate check against the configured GitHub
+Releases repo. Without this command the firmware checks on its own
+~30 s after boot and once an hour while WiFi is up.
+
+```json
+{"cmd":"ota"}                          // ack: {"ack":"ota","ok":true}
+{"cmd":"ota","action":"check"}         // same
+```
+
+If the latest release's `tag_name` parses to a higher semver than the
+compiled-in `FIRMWARE_VERSION`, the device:
+1. stops BLE advertising and frees the LCD sprite
+2. streams the `firmware-waveshare-c6.bin` asset over HTTPS
+3. writes it to the inactive OTA partition
+4. reboots into the new image
+
+The release URL pattern is fixed:
+```
+GET  https://api.github.com/repos/<OWNER>/<REPO>/releases/latest
+GET  https://github.com/<OWNER>/<REPO>/releases/latest/download/<ASSET>
+```
+
+where `<OWNER>`, `<REPO>`, `<ASSET>` are set at compile time via
+`platformio.ini` build flags.
+
+## Extended status response
+
+The `status` ack from this fork carries two extra blocks under `data`:
+
+```json
+{
+  "wifi": {
+    "state": "connected",       // off | scanning | connecting | connected | backoff
+    "ssid": "Home",
+    "rssi": -62,
+    "ip": "192.168.11.166",
+    "saved": 2                  // number of stored credentials
+  },
+  "ota": {
+    "state": "idle",            // idle | checking | downloading | done | error
+    "current": "0.1.0",
+    "remote": "0.2.0",          // last-seen tag_name; "" before first check
+    "progress": 0               // 0..100 during downloading
+  }
+}
+```
+
+Other fields (`name`, `owner`, `sec`, `bat`, `sys`, `stats`) follow the
+upstream schema; `bat` reports a fixed USB-powered value since this board
+has no PMIC.

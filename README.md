@@ -1,172 +1,213 @@
-# claude-desktop-buddy
+# claude-desktop-buddy — Waveshare ESP32-C6-LCD-1.47 fork
 
-Claude for macOS and Windows can connect Claude Cowork and Claude Code to
-maker devices over BLE, so developers and makers can build hardware that
-displays permission prompts, recent messages, and other interactions. We've
-been impressed by the creativity of the maker community around Claude -
-providing a lightweight, opt-in API is our way of making it easier to build
-fun little hardware devices that integrate with Claude.
+A fork of [anthropics/claude-desktop-buddy](https://github.com/anthropics/claude-desktop-buddy)
+that runs the desk pet firmware on the Waveshare ESP32-C6-LCD-1.47 dev
+board, with WiFi station support and over-the-air auto-update from
+GitHub Releases.
 
-> **Building your own device?** You don't need any of the code here. See
-> **[REFERENCE.md](REFERENCE.md)** for the wire protocol: Nordic UART
-> Service UUIDs, JSON schemas, and the folder push transport.
+> Looking for the M5StickC Plus original? See the
+> [upstream repository](https://github.com/anthropics/claude-desktop-buddy)
+> — its `main` branch tracks the M5StickC build. This fork's `main` follows
+> upstream protocol changes but ships a Waveshare-targeted firmware.
 
-As an example, we built a desk pet on ESP32 that lives off permission
-approvals and interaction with Claude. It sleeps when nothing's happening,
-wakes when sessions start, gets visibly impatient when an approval prompt is
-waiting, and lets you approve or deny right from the device.
+## What changed vs. upstream
 
-<p align="center">
-  <img src="docs/device.jpg" alt="M5StickC Plus running the buddy firmware" width="500">
-</p>
+| Upstream (M5StickC Plus)        | This fork (Waveshare ESP32-C6-LCD-1.47)                      |
+| ------------------------------- | ------------------------------------------------------------ |
+| ESP32 PICO                      | ESP32-C6 (Wi-Fi 6 + BLE 5)                                   |
+| ST7789v2 135×240                | ST7789 172×320 (more vertical breathing room)                |
+| MPU6886 IMU                     | none — face-down nap replaced with idle-timer nap            |
+| AXP192 PMIC + Li-Po             | USB-only, no battery; brightness via PWM                     |
+| BM8563 RTC                      | ESP32-C6 internal clock, time sync from desktop              |
+| Buzzer on GPIO2                 | none — beep events flash the WS2812 RGB LED on GPIO8         |
+| BtnA + BtnB + Pwr               | single BOOT button (GPIO9), tap/double-tap/hold decoded      |
+| WiFi unused                     | WiFi station: connects to strongest saved AP, 3-fail backoff |
+| Single app slot                 | OTA: ota_0 / ota_1 ping-pong from GitHub Releases            |
+| 18 ASCII species + GIF pet      | unchanged                                                    |
 
-## Hardware
+Sources in [`src/`](src/) are the upstream code with minimal targeted
+edits plus three new subsystems:
+- [`src/wifi_link.cpp`](src/wifi_link.cpp) — non-blocking WiFi station
+- [`src/wifi_creds.h`](src/wifi_creds.h) — multi-network storage
+- [`src/ota_update.cpp`](src/ota_update.cpp) — GitHub Releases OTA
 
-The firmware targets ESP32 with the Arduino framework. As written, it
-depends on the M5StickCPlus library for its display, IMU, and button
-drivers—so you'll need that board, or a fork that swaps those drivers for
-your own pin layout.
+[`lib/M5Shim/`](lib/M5Shim) is a drop-in `M5StickCPlus.h` that re-exposes
+the M5 API on top of LovyanGFX + Arduino primitives. Upstream
+`#include <M5StickCPlus.h>` lines compile as-is.
 
-## Flashing
+## Single-button UX
 
-Install
-[PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/),
-then:
+Only the BOOT pin is wired to a button — RESET is hard-wired to chip reset.
+[`lib/M5Shim/src/M5StickCPlus.cpp`](lib/M5Shim/src/M5StickCPlus.cpp)
+synthesizes the three original button actions from one switch:
+
+| Gesture       | Original action        | Use it for            |
+| ------------- | ---------------------- | --------------------- |
+| Short tap     | `BtnA.wasReleased`     | next screen / approve |
+| Hold ≥ 400 ms | `BtnB.wasPressed`      | scroll / page / deny  |
+| Double-tap    | `BtnA.pressedFor(600)` | open menu             |
+
+Single-tap is deferred ~350 ms to disambiguate from a double-tap; that's
+the only visible delay the rework introduces.
+
+## Building (Docker only — no host toolchain)
 
 ```bash
-pio run -t upload
+# 1. Firmware build (~15 min first time, ~30 s incremental)
+docker compose run --rm build
+
+# 2. LittleFS image with the bundled GIF character
+docker compose run --rm fs
 ```
 
-If you're starting from a previously-flashed device, wipe it first:
+Output: `.pio/build/waveshare-esp32-c6/firmware.bin` and `littlefs.bin`.
+
+## First flash (USB)
+
+The new OTA-capable partition layout in
+[`partitions/ota_8mb.csv`](partitions/ota_8mb.csv) needs a one-time serial
+flash. After that all updates ship over the air.
+
+On macOS / Linux with Python and esptool:
 
 ```bash
-pio run -t erase && pio run -t upload
+# Backup current flash first (recommended for upgrades)
+esptool --chip esp32c6 --port /dev/cu.usbmodem101 --baud 460800 \
+        read_flash 0 0x400000 backup.bin
+
+# Wipe otadata so the bootloader starts from ota_0
+esptool --chip esp32c6 --port /dev/cu.usbmodem101 --baud 460800 \
+        erase_region 0x3F0000 0x2000
+
+# Flash bootloader + partition table + firmware
+esptool --chip esp32c6 --port /dev/cu.usbmodem101 --baud 460800 \
+        write_flash --flash_mode dio --flash_freq 80m --flash_size 8MB \
+        0x0     .pio/build/waveshare-esp32-c6/bootloader.bin \
+        0x8000  .pio/build/waveshare-esp32-c6/partitions.bin \
+        0x10000 .pio/build/waveshare-esp32-c6/firmware.bin
 ```
 
-Once running, you can also wipe everything from the device itself: **hold A
-→ settings → reset → factory reset → tap twice**.
+Windows users: [`scripts/flash-from-host.ps1`](scripts/flash-from-host.ps1)
+wraps the same logic. There's also `docker compose run --rm flash` which
+needs [usbipd-win](https://github.com/dorssel/usbipd-win) to expose COM3
+into WSL — see the script comments.
 
-## Pairing
+**Important** — flash with `--flash-mode dio`, not `qio`. The arduino-esp32
+v3.x bootloader for ESP32-C6 is built DIO; flashing the app in QIO leaves
+the chip in a TG0_WDT reset loop right after the ROM prints `ets_loader.c
+67`. Both the docker-compose `flash` service and the PowerShell helper
+already set this. PlatformIO picks it up from `board_build.flash_mode = dio`.
 
-To pair your device with Claude, first enable developer mode (**Help →
-Troubleshooting → Enable Developer Mode**). Then, open the Hardware Buddy
-window in **Developer → Open Hardware Buddy…**, click **Connect**, and pick
-your device from the list. macOS will prompt for Bluetooth permission on
-first connect; grant it.
+## WiFi configuration
 
-<p align="center">
-  <img src="docs/menu.png" alt="Developer → Open Hardware Buddy… menu item" width="420">
-  <img src="docs/hardware-buddy-window.png" alt="Hardware Buddy window with Connect button and folder drop target" width="420">
-</p>
+Three delivery channels — pick whichever fits:
 
-Once paired, the bridge auto-reconnects whenever both sides are awake.
+**1. Direct BLE command** ([`scripts/wifi-push-ble.py`](scripts/wifi-push-ble.py)):
 
-If discovery isn't finding the stick:
+```bash
+pip install bleak
+scripts/wifi-push-ble.py add "MyNetwork" "mypassword"
+scripts/wifi-push-ble.py list
+scripts/wifi-push-ble.py remove "OldNetwork"
+scripts/wifi-push-ble.py clear
+```
 
-- Make sure it's awake (any button press)
-- Check the stick's settings menu → bluetooth is on
+Same JSON protocol as the desktop app; any BLE client (nRF Connect, Web
+Bluetooth) works once paired. See [REFERENCE.md](REFERENCE.md) for the
+`cmd:"wifi"` schema.
 
-## Controls
+**2. Folder push via Claude desktop app:**
 
-|                         | Normal               | Pet         | Info        | Approval    |
-| ----------------------- | -------------------- | ----------- | ----------- | ----------- |
-| **A** (front)           | next screen          | next screen | next screen | **approve** |
-| **B** (right)           | scroll transcript    | next page   | next page   | **deny**    |
-| **Hold A**              | menu                 | menu        | menu        | menu        |
-| **Power** (left, short) | toggle screen off    |             |             |             |
-| **Power** (left, ~6s)   | hard power off       |             |             |             |
-| **Shake**               | dizzy                |             |             | —           |
-| **Face-down**           | nap (energy refills) |             |             |             |
-
-The screen auto-powers-off after 30s of no interaction (kept on while an
-approval prompt is up). Any button press wakes it.
-
-## ASCII pets
-
-Eighteen pets, each with seven animations (sleep, idle, busy, attention,
-celebrate, dizzy, heart). Menu → "next pet" cycles them with a counter.
-Choice persists to NVS.
-
-## GIF pets
-
-If you want a custom GIF character instead of an ASCII buddy, drag a
-character pack folder onto the drop target in the Hardware Buddy window. The
-app streams it over BLE and the stick switches to GIF mode live. **Settings
-→ delete char** reverts to ASCII mode.
-
-A character pack is a folder with `manifest.json` and 96px-wide GIFs:
+Create a folder with `wifi.json` inside:
 
 ```json
-{
-  "name": "bufo",
-  "colors": {
-    "body": "#6B8E23",
-    "bg": "#000000",
-    "text": "#FFFFFF",
-    "textDim": "#808080",
-    "ink": "#000000"
-  },
-  "states": {
-    "sleep": "sleep.gif",
-    "idle": ["idle_0.gif", "idle_1.gif", "idle_2.gif"],
-    "busy": "busy.gif",
-    "attention": "attention.gif",
-    "celebrate": "celebrate.gif",
-    "dizzy": "dizzy.gif",
-    "heart": "heart.gif"
-  }
-}
+{"nets":[{"ssid":"Home","psk":"a"},{"ssid":"Work","psk":"b"}]}
 ```
 
-State values can be a single filename or an array. Arrays rotate: each
-loop-end advances to the next GIF, useful for an idle activity carousel so
-the home screen doesn't loop one clip forever.
+Drag the folder onto the **Hardware Buddy** window (Developer →
+Open Hardware Buddy…). The file gets routed to `/config/wifi.json` on
+LittleFS without touching the installed character.
 
-GIFs are 96px wide; height up to ~140px stays on a 135×240 portrait screen.
-Crop tight to the character — transparent margins waste screen and shrink
-the sprite. `tools/prep_character.py` handles the resize: feed it source
-GIFs at any sizes and it produces a 96px-wide set where the character is the
-same scale in every state.
+**3. USB-Serial** ([`scripts/wifi-push-serial.py`](scripts/wifi-push-serial.py)):
 
-The whole folder must fit under 1.8MB —
-`gifsicle --lossy=80 -O3 --colors 64` typically cuts 40–60%.
-
-See `characters/bufo/` for a working example.
-
-If you're iterating on a character and would rather skip the BLE round-trip,
-`tools/flash_character.py characters/bufo` stages it into `data/` and runs
-`pio run -t uploadfs` directly over USB.
-
-## The seven states
-
-| State       | Trigger                     | Feel                        |
-| ----------- | --------------------------- | --------------------------- |
-| `sleep`     | bridge not connected        | eyes closed, slow breathing |
-| `idle`      | connected, nothing urgent   | blinking, looking around    |
-| `busy`      | sessions actively running   | sweating, working           |
-| `attention` | approval pending            | alert, **LED blinks**       |
-| `celebrate` | level up (every 50K tokens) | confetti, bouncing          |
-| `dizzy`     | you shook the stick         | spiral eyes, wobbling       |
-| `heart`     | approved in under 5s        | floating hearts             |
-
-## Project layout
-
-```
-src/
-  main.cpp       — loop, state machine, UI screens
-  buddy.cpp      — ASCII species dispatch + render helpers
-  buddies/       — one file per species, seven anim functions each
-  ble_bridge.cpp — Nordic UART service, line-buffered TX/RX
-  character.cpp  — GIF decode + render
-  data.h         — wire protocol, JSON parse
-  xfer.h         — folder push receiver
-  stats.h        — NVS-backed stats, settings, owner, species choice
-characters/      — example GIF character packs
-tools/           — generators and converters
+```bash
+pip install pyserial
+scripts/wifi-push-serial.py add "MyNetwork" "mypassword"
 ```
 
-## Availability
+The buddy stores up to 8 networks. On boot (and once an hour) it scans,
+filters for saved SSIDs, ranks by RSSI, and connects to the strongest. If
+the strongest fails three times in a row (wrong password / unreachable),
+it falls through to the next. When all candidates exhaust, it backs off
+for 5 minutes and rescans.
 
-The BLE API is only available when the desktop apps are in developer mode
-(**Help → Troubleshooting → Enable Developer Mode**). It's intended for
-makers and developers and isn't an officially supported product feature.
+## OTA auto-update
+
+Once WiFi is up, the device polls `https://api.github.com/repos/OWNER/REPO/releases/latest`
+30 seconds after boot and then once an hour. If the release `tag_name`
+sorts newer than the compiled-in `FIRMWARE_VERSION`, it downloads the
+`firmware-waveshare-c6.bin` asset over HTTPS, writes it to the inactive
+OTA partition, and reboots into the new image.
+
+Configured via [`platformio.ini`](platformio.ini) `build_flags`:
+
+```
+-DFIRMWARE_VERSION='"0.1.0"'
+-DOTA_OWNER='"hartmanfrost"'
+-DOTA_REPO='"claude-desktop-buddy"'
+-DOTA_ASSET='"firmware-waveshare-c6.bin"'
+```
+
+To cut a release: bump `FIRMWARE_VERSION`, build, then
+
+```bash
+gh release create v0.2.0 \
+   .pio/build/waveshare-esp32-c6/firmware.bin#firmware-waveshare-c6.bin \
+   --title "v0.2.0" --notes "What changed…"
+```
+
+The `#firmware-waveshare-c6.bin` suffix renames the asset on upload —
+must match `OTA_ASSET` exactly.
+
+**Manual trigger.** From any BLE/Serial client: `{"cmd":"ota"}`. Status
+visible in the `status` ack under `data.ota`:
+
+```json
+{"state":"checking","current":"0.1.0","remote":"0.2.0","progress":0}
+```
+
+**Security caveat.** Current build uses `setInsecure()` for the TLS
+connection — encryption is on but cert validation is off, so a MITM on
+the path to GitHub could substitute firmware. Acceptable on a trusted
+home network for hobby use; for anything more, embed the Mozilla CA
+bundle via `board_build.embed_files` and switch to `setCACertBundle()`.
+There's a `FIXME` comment in [`src/ota_update.cpp`](src/ota_update.cpp).
+
+## Pairing with Claude desktop
+
+Same as upstream — turn on Developer mode (**Help → Troubleshooting →
+Enable Developer Mode**) in Claude for macOS/Windows, then
+**Developer → Open Hardware Buddy…**, click **Connect**, pick the device
+("Claude-XXXX"). Enter the 6-digit passkey shown on the device when
+prompted.
+
+## Repo layout
+
+```
+src/                   # adapted firmware (small W/H + LED stubs vs upstream,
+                       # plus wifi_link, wifi_creds, ota_update)
+lib/M5Shim/            # M5StickCPlus.h compatibility layer
+characters/            # GIF character pack (bufo, from upstream)
+data/characters/       # LittleFS source for `docker compose run --rm fs`
+partitions/
+  no_ota.csv           # original 4MB single-app layout (for reference)
+  ota_8mb.csv          # current 8MB OTA-capable layout
+docker/Dockerfile      # PlatformIO + esptool in python:3.12-slim
+docker-compose.yml     # build / fs / flash / flashfs / monitor services
+scripts/
+  attach-usb.ps1       # usbipd helper for docker flashing (Windows)
+  flash-from-host.ps1  # host-side esptool flash (Windows)
+  wifi-push-ble.py     # push WiFi creds over BLE
+  wifi-push-serial.py  # push WiFi creds over USB-Serial
+platformio.ini
+```

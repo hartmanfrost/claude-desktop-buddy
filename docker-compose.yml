@@ -1,0 +1,58 @@
+# Build / flash / monitor flows for the claude-desktop-buddy port.
+#
+# Build runs anywhere with Docker. Flash and monitor need access to /dev/ttyACM0
+# inside the container, which on Windows requires usbipd-win to attach the
+# board's USB device to WSL first (see README.md).
+
+services:
+  build:
+    build: ./docker
+    image: claudegochi/pio:latest
+    working_dir: /workspace/firmware
+    volumes:
+      - ./firmware:/workspace/firmware
+      - pio-cache:/pio/.platformio
+    command: pio run -e waveshare-esp32-c6
+
+  fs:
+    image: claudegochi/pio:latest
+    working_dir: /workspace/firmware
+    volumes:
+      - ./firmware:/workspace/firmware
+      - pio-cache:/pio/.platformio
+    command: pio run -e waveshare-esp32-c6 -t buildfs
+
+  flash:
+    image: claudegochi/pio:latest
+    working_dir: /workspace/firmware
+    volumes:
+      - ./firmware:/workspace/firmware
+      - pio-cache:/pio/.platformio
+    devices:
+      - "/dev/ttyACM0:/dev/ttyACM0"
+    command: pio run -e waveshare-esp32-c6 -t upload --upload-port /dev/ttyACM0
+
+  flashfs:
+    image: claudegochi/pio:latest
+    working_dir: /workspace/firmware
+    volumes:
+      - ./firmware:/workspace/firmware
+      - pio-cache:/pio/.platformio
+    devices:
+      - "/dev/ttyACM0:/dev/ttyACM0"
+    command: pio run -e waveshare-esp32-c6 -t uploadfs --upload-port /dev/ttyACM0
+
+  monitor:
+    image: claudegochi/pio:latest
+    working_dir: /workspace/firmware
+    volumes:
+      - ./firmware:/workspace/firmware
+      - pio-cache:/pio/.platformio
+    devices:
+      - "/dev/ttyACM0:/dev/ttyACM0"
+    stdin_open: true
+    tty: true
+    command: pio device monitor -e waveshare-esp32-c6 -p /dev/ttyACM0 -b 115200
+
+volumes:
+  pio-cache:

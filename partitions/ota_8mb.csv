@@ -1,0 +1,20 @@
+# OTA-capable layout for ESP32-C6FH8 (8MB flash).
+#
+# Designed to be a drop-in for the previous 4MB no_ota layout so the
+# currently-flashed firmware boots unchanged from the new table:
+#   - nvs  stays at 0x9000/0x6000  → pet name, owner, BLE bonds, stats survive
+#   - ota_0 = old app0 at 0x10000/0x1F0000 → existing firmware boots from here
+#   - spiffs (littlefs) stays at 0x200000/0x1F0000 → bufo + /config/wifi.json survive
+#
+# New region (was unused 4MB-8MB):
+#   - otadata at 0x3F0000/0x2000 (where coredump used to sit; coredump dropped)
+#   - ota_1   at 0x400000/0x1F0000 (second app slot — OTA target)
+#
+# Bootloader reads otadata to pick ota_0 vs ota_1. Erased otadata → ota_0.
+#
+# Name,    Type, SubType,  Offset,   Size,     Flags
+nvs,       data, nvs,      0x9000,   0x6000,
+ota_0,     app,  ota_0,    0x10000,  0x1F0000,
+spiffs,    data, spiffs,   0x200000, 0x1F0000,
+otadata,   data, ota,      0x3F0000, 0x2000,
+ota_1,     app,  ota_1,    0x400000, 0x1F0000,

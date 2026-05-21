@@ -1,15 +1,28 @@
 #pragma once
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <FS.h>
 #include "ble_bridge.h"
+#include "wifi_creds.h"
+#include "wifi_link.h"
+#include "ota_update.h"
 #include <mbedtls/base64.h>
 #include <ArduinoJson.h>
+
+// arduino-esp32 v3 keeps File inside the fs:: namespace.
+using fs::File;
 
 static File     _xFile;
 static uint32_t _xExpected = 0, _xWritten = 0;
 static char     _xCharName[24] = "";
 static bool     _xActive = false;
 static uint32_t _xTotal = 0, _xTotalWritten = 0;
+// Lazy character wipe: char_begin no longer nukes /characters/ upfront.
+// Instead the wipe happens on the first non-config file. Lets a folder
+// containing only wifi.json (or other /config/ files) pass through
+// without clobbering the currently-installed character.
+static bool     _xCharWiped     = false;
+static bool     _xWifiTouched   = false;   // wifi.json received in this transfer
 
 // Ack goes to both streams — we don't track which one delivered the command,
 // and writes to a clientless SerialBT just drop. The bridge listens on
@@ -109,6 +122,79 @@ inline bool xferCommand(JsonDocument& doc) {
     return true;
   }
 
+  // WiFi credentials store (multi-network). Variants:
+  //   {"cmd":"wifi","ssid":"Home","psk":"abc"}                 add/update
+  //   {"cmd":"wifi","ssid":"Home","action":"remove"}           drop one
+  //   {"cmd":"wifi","action":"list"}                           list SSIDs
+  //   {"cmd":"wifi","action":"clear"}                          wipe all
+  //   {"cmd":"wifi","nets":[{"ssid":"H","psk":"a"},...]}       replace all
+  // Stored in /config/wifi.json on LittleFS; see wifi_creds.h for schema.
+  if (strcmp(cmd, "wifi") == 0) {
+    const char* action = doc["action"] | "";
+
+    if (strcmp(action, "clear") == 0) {
+      bool ok = wifiCredsClear();
+      if (ok) wifiLinkCredsChanged();
+      _xAck("wifi", ok);
+      return true;
+    }
+
+    if (strcmp(action, "list") == 0) {
+      JsonDocument cur, out;
+      wifiCredsLoad(cur);
+      out["ack"] = "wifi";
+      out["ok"] = true;
+      out["action"] = "list";
+      JsonArray ssids = out["ssids"].to<JsonArray>();
+      for (JsonVariant v : cur["nets"].as<JsonArray>()) {
+        ssids.add(v["ssid"] | "");
+      }
+      char b[400];
+      size_t len = serializeJson(out, b, sizeof(b) - 1);
+      if (len > 0) {
+        b[len++] = '\n';
+        Serial.write(b, len);
+        bleWrite((const uint8_t*)b, len);
+      }
+      return true;
+    }
+
+    if (doc["nets"].is<JsonArray>()) {
+      uint8_t n = wifiCredsReplaceAll(doc["nets"].as<JsonArrayConst>());
+      wifiLinkCredsChanged();
+      _xAck("wifi", true, n);
+      return true;
+    }
+
+    const char* ssid = doc["ssid"];
+    if (strcmp(action, "remove") == 0) {
+      bool ok = wifiCredsRemove(ssid);
+      if (ok) wifiLinkCredsChanged();
+      _xAck("wifi", ok);
+      return true;
+    }
+    if (ssid) {
+      const char* psk = doc["psk"] | "";
+      bool ok = wifiCredsAdd(ssid, psk);
+      if (ok) wifiLinkCredsChanged();
+      _xAck("wifi", ok);
+      return true;
+    }
+
+    _xAck("wifi", false);
+    return true;
+  }
+
+  // Manual OTA trigger. Any form accepted; the device will check
+  // GitHub Releases immediately on the next tick.
+  //   {"cmd":"ota"}                        force check now
+  //   {"cmd":"ota","action":"check"}       same
+  if (strcmp(cmd, "ota") == 0) {
+    otaCheckNow();
+    _xAck("ota", true);
+    return true;
+  }
+
   if (strcmp(cmd, "status") == 0) {
     // Dump everything the info screens show. Manual printf rather than
     // ArduinoJson serialize — less heap churn, and the shape is fixed.
@@ -117,13 +203,17 @@ inline bool xferCommand(JsonDocument& doc) {
     int vBus = (int)(M5.Axp.GetVBusVoltage() * 1000);
     int pct = (vBat - 3200) / 10;
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-    char b[320];
+    uint32_t ip = wifiLinkIp();
+    char b[640];
     int len = snprintf(b, sizeof(b),
       "{\"ack\":\"status\",\"ok\":true,\"n\":0,\"data\":{"
       "\"name\":\"%s\",\"owner\":\"%s\",\"sec\":%s,"
       "\"bat\":{\"pct\":%d,\"mV\":%d,\"mA\":%d,\"usb\":%s},"
       "\"sys\":{\"up\":%lu,\"heap\":%u,\"fsFree\":%lu,\"fsTotal\":%lu},"
-      "\"stats\":{\"appr\":%u,\"deny\":%u,\"vel\":%u,\"nap\":%lu,\"lvl\":%u}"
+      "\"stats\":{\"appr\":%u,\"deny\":%u,\"vel\":%u,\"nap\":%lu,\"lvl\":%u},"
+      "\"wifi\":{\"state\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,"
+      "\"ip\":\"%lu.%lu.%lu.%lu\",\"saved\":%u},"
+      "\"ota\":{\"state\":\"%s\",\"current\":\"%s\",\"remote\":\"%s\",\"progress\":%u}"
       "}}\n",
       petName(), ownerName(), bleSecure() ? "true" : "false",
       pct, vBat, iBat, (vBus > 4000) ? "true" : "false",
@@ -131,7 +221,14 @@ inline bool xferCommand(JsonDocument& doc) {
       (unsigned long)(LittleFS.totalBytes() - LittleFS.usedBytes()),
       (unsigned long)LittleFS.totalBytes(),
       stats().approvals, stats().denials, statsMedianVelocity(),
-      (unsigned long)stats().napSeconds, stats().level
+      (unsigned long)stats().napSeconds, stats().level,
+      wifiLinkStateName(), wifiLinkSsid(), (int)wifiLinkRssi(),
+      (unsigned long)(ip & 0xFF),
+      (unsigned long)((ip >> 8) & 0xFF),
+      (unsigned long)((ip >> 16) & 0xFF),
+      (unsigned long)((ip >> 24) & 0xFF),
+      wifiCredsCount(),
+      otaStateName(), otaCurrentVersion(), otaRemoteVersion(), otaProgressPct()
     );
     Serial.write(b, len);
     bleWrite((const uint8_t*)b, len);
@@ -175,12 +272,10 @@ inline bool xferCommand(JsonDocument& doc) {
     }
 
     strncpy(_xCharName, name, sizeof(_xCharName)-1); _xCharName[sizeof(_xCharName)-1]=0;
-    characterClose();
-    _xWipeAllChars();
-    char dir[48]; snprintf(dir, sizeof(dir), "/characters/%s", _xCharName);
-    LittleFS.mkdir(dir);
     _xTotalWritten = 0;
     _xActive = true;
+    _xCharWiped = false;     // wipe deferred to first non-config file
+    _xWifiTouched = false;
     _xAck("char_begin", true);
     return true;
   }
@@ -192,6 +287,28 @@ inline bool xferCommand(JsonDocument& doc) {
     _xExpected = doc["size"] | 0;
     _xWritten = 0;
     if (!path) { _xAck("file", false); return true; }
+
+    // Config files (wifi.json today, future extensions later) live in
+    // /config/ and never trigger the character wipe. This is how the
+    // single-file UX works: drop a folder containing only wifi.json and
+    // the installed character is preserved.
+    if (strcmp(path, "wifi.json") == 0) {
+      LittleFS.mkdir("/config");
+      _xFile = LittleFS.open("/config/wifi.json", "w");
+      _xWifiTouched = true;
+      _xAck("file", (bool)_xFile);
+      return true;
+    }
+
+    // Non-config file → first one in the transfer triggers the character
+    // wipe + mkdir. Existing character is closed so its GIF handles drop.
+    if (!_xCharWiped) {
+      characterClose();
+      _xWipeAllChars();
+      char dir[48]; snprintf(dir, sizeof(dir), "/characters/%s", _xCharName);
+      LittleFS.mkdir(dir);
+      _xCharWiped = true;
+    }
     char full[80]; snprintf(full, sizeof(full), "/characters/%s/%s", _xCharName, path);
     _xFile = LittleFS.open(full, "w");
     _xAck("file", (bool)_xFile);
@@ -224,9 +341,20 @@ inline bool xferCommand(JsonDocument& doc) {
 
   if (strcmp(cmd, "char_end") == 0) {
     _xActive = false;
-    bool ok = characterInit(_xCharName);
-    extern bool buddyMode, gifAvailable;
-    if (ok) { buddyMode = false; gifAvailable = true; speciesIdxSave(0xFF); }
+    bool ok;
+    if (_xCharWiped) {
+      ok = characterInit(_xCharName);
+      extern bool buddyMode, gifAvailable;
+      if (ok) { buddyMode = false; gifAvailable = true; speciesIdxSave(0xFF); }
+    } else {
+      // Pure config-file transfer (only wifi.json or similar). Nothing
+      // to initialise; bufo (or whatever was installed) is still there.
+      ok = true;
+    }
+    if (_xWifiTouched) {
+      _xWifiTouched = false;
+      wifiLinkCredsChanged();   // re-scan now that the file has new content
+    }
     _xAck("char_end", ok);
     return true;
   }

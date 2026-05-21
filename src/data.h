@@ -11,7 +11,11 @@ struct TamaState {
   bool     recentlyCompleted;
   uint32_t tokensToday;
   uint32_t lastUpdated;
-  char     msg[24];
+  // 60 chars (≈ 2.5× upstream 24) — the desktop drops user-typed status
+  // text in here, and Cyrillic eats 2 UTF-8 bytes per glyph, so the old
+  // buffer ran out after ~11 visible characters. drawHUD wraps msg into
+  // multiple HUD rows now to cope.
+  char     msg[60];
   bool     connected;
   char     lines[8][92];
   uint8_t  nLines;
@@ -64,8 +68,19 @@ inline const char* dataScenarioName() {
 
 // Set true once the bridge sends a time sync — until then the RTC may
 // hold whatever was on the coin cell (or 2000-01-01 if it lost power).
+//
+// We also sanity-check the actual wall clock: the ESP32-C6 has no
+// battery-backed RTC on this board, so settimeofday() values get wiped
+// on every hard reset / power cycle. `_rtcValid` is in regular RAM, so
+// it's wiped too — but if any code path ever ends up with the flag set
+// while time(NULL) still returns 1970, the clock face would render
+// uptime-as-wallclock. Guard against that here.
 static bool _rtcValid = false;
-inline bool dataRtcValid() { return _rtcValid; }
+inline bool dataRtcValid() {
+  if (!_rtcValid) return false;
+  time_t now; time(&now);
+  return now > 1700000000;   // anything before 2023-11 is implausible
+}
 
 static void _applyJson(const char* line, TamaState* out) {
   JsonDocument doc;

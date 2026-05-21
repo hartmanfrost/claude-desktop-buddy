@@ -1,8 +1,12 @@
 #include "character.h"
 #include <M5StickCPlus.h>
 #include <LittleFS.h>
+#include <FS.h>
 #include <AnimatedGIF.h>
 #include <ArduinoJson.h>
+
+// arduino-esp32 v3 keeps File inside the fs:: namespace.
+using fs::File;
 
 extern TFT_eSprite spr;
 
@@ -45,13 +49,21 @@ static bool        peekMode = false;
 // Draw target — defaults to the sprite; characterRenderTo() retargets to
 // M5.Lcd for the landscape clock (both inherit TFT_eSPI).
 static TFT_eSPI*   _tgt = &spr;
-// Peek mode renders at half scale (2:1 nearest-neighbor in gifDrawCb) so
-// the whole pet fits the 70px window instead of cropping the top.
+// Home-mode scale factor — character packs were authored for the 135 px
+// M5StickC and look tiny on our 172×320 Waveshare panel. Upscale 2× and
+// allow horizontal clipping; the bundled bufo art is well-centered in
+// its 96×100 canvas so the lost edges are background pixels.
+static const int   HOME_SCALE = 2;
+// Peek mode renders at half scale (2:1 nearest-neighbor in gifDrawCb)
+// so the whole pet fits the 70 px peek window. Home mode scales up.
 static void gifPlace() {
-  int outW = peekMode ? gifW / 2 : gifW;
-  int outH = peekMode ? gifH / 2 : gifH;
+  int outW = peekMode ? gifW / 2 : gifW * HOME_SCALE;
+  int outH = peekMode ? gifH / 2 : gifH * HOME_SCALE;
   gifX = (spr.width() - outW) / 2;
-  gifY = peekMode ? (PEEK_TOP - outH) / 2 : (140 - outH) / 2;
+  // Home mode uses the upper ~250 px of the panel (everything above the
+  // 40 px HUD strip). gifY can go negative when outH would exceed that —
+  // gifDrawCb clips per-pixel below.
+  gifY = peekMode ? (PEEK_TOP - outH) / 2 : (250 - outH) / 2;
 }
 static uint32_t    nextFrameAt = 0;
 static uint32_t    animPauseUntil = 0;
@@ -124,15 +136,30 @@ static void gifDrawCb(GIFDRAW* d) {
     return;
   }
 
-  int y = gifY + srcY;
-  if (y < 0 || y >= spr.height()) return;
-  int x0 = gifX + d->iX;
+  // Home mode: HOME_SCALE × upscale (default 2×). Each source pixel
+  // writes a HOME_SCALE × HOME_SCALE block. Horizontal clipping happens
+  // per-pixel because the bufo-sized GIF (96×100 → 192×200) is wider
+  // than the 172 px panel at 2×; we lose ~10 px of background on each
+  // side, the character itself stays centered.
+  const int S = HOME_SCALE;
+  int y0 = gifY + srcY * S;
+  if (y0 + S <= 0 || y0 >= spr.height()) return;
+  int x0 = gifX + d->iX * S;
   int w  = d->iWidth;
-  if (w > 256) w = 256;
-  if (x0 < 0) { src -= x0; w += x0; x0 = 0; }
-  if (x0 + w > spr.width()) w = spr.width() - x0;
-  if (w <= 0) return;
-  for (int i = 0; i < w; i++) put(x0 + i, y, src[i]);
+  for (int i = 0; i < w; i++) {
+    uint8_t idx = src[i];
+    uint16_t color = (hasT && idx == t) ? pal.bg : pal16[idx];
+    int dx = x0 + i * S;
+    for (int sy = 0; sy < S; sy++) {
+      int dy = y0 + sy;
+      if (dy < 0 || dy >= spr.height()) continue;
+      for (int sx = 0; sx < S; sx++) {
+        int xx = dx + sx;
+        if (xx < 0 || xx >= spr.width()) continue;
+        _tgt->drawPixel(xx, dy, color);
+      }
+    }
+  }
 }
 
 // --- Public -------------------------------------------------------------

@@ -9,8 +9,11 @@ extern TFT_eSprite spr;
 enum { B_SLEEP, B_IDLE, B_BUSY, B_ATTENTION, B_CELEBRATE, B_DIZZY, B_HEART };
 
 // ──────────────── shared geometry ────────────────
-const int BUDDY_X_CENTER = 67;
-const int BUDDY_CANVAS_W = 135;
+// 172px-wide screen (was 135 on M5StickC Plus). Center the buddy on the new
+// canvas so all the species art that hardcodes offsets to BUDDY_X_CENTER
+// stays balanced.
+const int BUDDY_X_CENTER = 86;
+const int BUDDY_CANVAS_W = 172;
 const int BUDDY_Y_BASE   = 30;
 const int BUDDY_Y_OVERLAY = 6;
 const int BUDDY_CHAR_W   = 6;

@@ -60,10 +60,38 @@ inline void statsSave() {
   _dirty = false;
 }
 
+// Transcript activity ring — used as mood proxy when velocity ring is empty
+// (bypass-permissions users never produce approvals, so velocity stays 0 and
+// mood would otherwise lock at neutral 2). Holds timestamps of the last 30
+// lineGen ticks; statsActivityLastHour() filters to the last 60 minutes.
+static const uint8_t ACTIVITY_RING_N = 30;
+static uint32_t _activityRing[ACTIVITY_RING_N] = {0};
+static uint8_t  _activityIdx = 0;
+
+inline void statsOnLineGen() {
+  _activityRing[_activityIdx] = millis();
+  _activityIdx = (_activityIdx + 1) % ACTIVITY_RING_N;
+}
+
+inline uint8_t statsActivityLastHour() {
+  uint32_t now = millis();
+  uint32_t cutoff = (now > 3600000UL) ? (now - 3600000UL) : 0;
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < ACTIVITY_RING_N; i++) {
+    uint32_t ts = _activityRing[i];
+    if (ts != 0 && ts >= cutoff && ts <= now) count++;
+  }
+  return count;
+}
+
 // Level is token-driven now; approvals only feed mood/velocity.
 inline void statsOnApproval(uint32_t secondsToRespond) {
   _stats.approvals++;
-  _stats.velocity[_stats.velIdx] = (uint16_t)min(secondsToRespond, 65535u);
+  // Cast both args to the same uint32_t so g++ on riscv32 doesn't fail to
+  // deduce std::min's template — uint32_t and `unsigned` are different
+  // canonical types under this toolchain.
+  _stats.velocity[_stats.velIdx] =
+      (uint16_t)min((uint32_t)secondsToRespond, (uint32_t)65535u);
   _stats.velIdx = (_stats.velIdx + 1) % 8;
   if (_stats.velCount < 8) _stats.velCount++;
   _dirty = true; statsSave();
@@ -118,11 +146,6 @@ inline void statsOnDenial() { _stats.denials++; _dirty = true; statsSave(); }
 
 inline void statsMarkDirty() { _dirty = true; }
 
-inline void statsOnNapEnd(uint32_t seconds) {
-  _stats.napSeconds += seconds;
-  _dirty = true; statsSave();
-}
-
 // Median of the velocity ring buffer. 0 if empty.
 inline uint16_t statsMedianVelocity() {
   if (_stats.velCount == 0) return 0;
@@ -139,10 +162,19 @@ inline uint16_t statsMedianVelocity() {
 }
 
 // 0..4 tier. Velocity sets the base; heavy denial ratio drags it down.
+// Fallback path: when there's no approval data (velCount==0), proxy mood
+// off transcript activity in the last hour — keeps the bar alive for
+// bypass-permissions users whose velocity ring never fills.
 inline uint8_t statsMoodTier() {
   uint16_t vel = statsMedianVelocity();
   int8_t tier;
-  if (vel == 0) tier = 2;              // no data: neutral
+  if (vel == 0) {
+    uint8_t act = statsActivityLastHour();
+    if      (act == 0)  tier = 1;
+    else if (act < 5)   tier = 2;
+    else if (act < 15)  tier = 3;
+    else                tier = 4;
+  }
   else if (vel < 15) tier = 4;
   else if (vel < 30) tier = 3;
   else if (vel < 60) tier = 2;
@@ -157,17 +189,53 @@ inline uint8_t statsMoodTier() {
   return (uint8_t)tier;
 }
 
-// Energy: starts at 3/5 on boot, tops up to full on nap end, drains 1 tier per 2h.
+// Energy: starts at 3/5 on boot. Awake: drains 1 tier per 2h. Napping:
+// refills 1 tier per 1h, capped at 5. Old face-down detector is dead on
+// this board (no IMU); main.cpp drives begin/end from idle-detection.
 static uint32_t _lastNapEndMs = 0;
-static uint8_t  _energyAtNap  = 3;
+static uint8_t  _energyAtNap  = 3;     // baseline at last wake
+static bool     _napping      = false;
+static uint32_t _napStartMs   = 0;
+static uint8_t  _napStartTier = 3;     // tier captured at nap start
 
-inline void statsOnWake() { _lastNapEndMs = millis(); _energyAtNap = 5; }
+inline bool statsIsNapping() { return _napping; }
 
 inline uint8_t statsEnergyTier() {
-  uint32_t hoursSince = (millis() - _lastNapEndMs) / 3600000;
-  int8_t e = (int8_t)_energyAtNap - (int8_t)(hoursSince / 2);
+  if (_napping) {
+    uint32_t hoursNapped = (millis() - _napStartMs) / 3600000UL;
+    int e = (int)_napStartTier + (int)hoursNapped;
+    if (e > 5) e = 5;
+    return (uint8_t)e;
+  }
+  uint32_t hoursSince = (millis() - _lastNapEndMs) / 3600000UL;
+  int e = (int)_energyAtNap - (int)(hoursSince / 2);
   if (e < 0) e = 0; if (e > 5) e = 5;
   return (uint8_t)e;
+}
+
+inline void statsBeginNap() {
+  if (_napping) return;
+  _napStartTier = statsEnergyTier();   // capture awake tier as nap start
+  _napStartMs   = millis();
+  _napping      = true;
+}
+
+// Wake from nap: commit accumulated refill to baseline, persist cumulative
+// nap seconds. Idempotent — calling without an active nap just resets the
+// awake-baseline timer (mirrors the old statsOnWake() semantics).
+inline void statsEndNap() {
+  uint32_t now = millis();
+  if (_napping) {
+    uint32_t napSecs = (now - _napStartMs) / 1000;
+    uint32_t hoursNapped = napSecs / 3600;
+    int e = (int)_napStartTier + (int)hoursNapped;
+    if (e > 5) e = 5;
+    _energyAtNap = (uint8_t)e;
+    _stats.napSeconds += napSecs;
+    _dirty = true; statsSave();
+    _napping = false;
+  }
+  _lastNapEndMs = now;
 }
 
 inline uint8_t statsFedProgress() {
