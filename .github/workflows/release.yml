@@ -1,0 +1,116 @@
+name: Release
+
+# Trigger: push a tag like v0.2.0 → CI builds firmware, creates the
+# GitHub release, and uploads firmware-waveshare-c6.bin (plus bootloader
+# and partition table) as release assets.
+#
+# After the workflow lands, the device's OTA loop (api.github.com/repos/
+# OWNER/REPO/releases/latest) will see the new tag and pull the binary
+# on its next hourly check.
+#
+# The FIRMWARE_VERSION baked into the firmware comes from the tag name
+# (leading 'v' stripped) — set as an env var before pio runs and picked
+# up by scripts/build/inject_version.py.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Allow firing the workflow manually for a dry-run build that doesn't
+  # publish a release. Useful for verifying a tag will build before
+  # actually pushing it.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Skip release publishing (just build)'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: write   # needed to create the release and upload assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so `git describe` in inject_version.py has tags
+          # available when invoked manually outside of a tag push.
+          fetch-depth: 0
+
+      - name: Resolve version from tag
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF_NAME#v}"
+            echo "version=$v" >> "$GITHUB_OUTPUT"
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            # Manual dispatch: use git describe so the binary still has
+            # a meaningful version string, but don't publish.
+            v=$(git describe --tags --always --dirty | sed 's/^v//')
+            echo "version=$v" >> "$GITHUB_OUTPUT"
+            echo "tag=dispatch-$v" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolved version: $v"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO core + packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade platformio
+
+      - name: Build firmware
+        env:
+          FIRMWARE_VERSION: ${{ steps.ver.outputs.version }}
+        run: pio run -e waveshare-esp32-c6
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp .pio/build/waveshare-esp32-c6/firmware.bin   dist/firmware-waveshare-c6.bin
+          cp .pio/build/waveshare-esp32-c6/bootloader.bin dist/bootloader.bin
+          cp .pio/build/waveshare-esp32-c6/partitions.bin dist/partitions.bin
+          ls -lh dist/
+          sha256sum dist/* > dist/SHA256SUMS.txt
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload artifacts (always — also for dispatch dry-runs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ steps.ver.outputs.version }}
+          path: dist/
+          retention-days: 14
+
+      - name: Create release
+        if: steps.ver.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/firmware-waveshare-c6.bin
+            dist/bootloader.bin
+            dist/partitions.bin
+            dist/SHA256SUMS.txt
