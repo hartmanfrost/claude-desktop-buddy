@@ -122,10 +122,13 @@ static void _drawOtaStatus() {
            _remoteVersion[0] ? _remoteVersion : "?");
   spr.drawString(buf, OTA_SPR_W/2, 60);
 
-  // Source URL (truncated to one line).
+  // Source repo, two lines so it fits 172px wide regardless of repo
+  // name length. First line is the owner, second is "/repo" so it reads
+  // as a path continuation.
   spr.setTextColor(p.textDim, p.bg);
-  snprintf(buf, sizeof(buf), "%s/%s", OTA_OWNER, OTA_REPO);
-  spr.drawString(buf, OTA_SPR_W/2, 76);
+  spr.drawString(OTA_OWNER, OTA_SPR_W/2, 76);
+  snprintf(buf, sizeof(buf), "/%s", OTA_REPO);
+  spr.drawString(buf, OTA_SPR_W/2, 90);
 
   // Progress bar.
   const int barX = 16, barY = 120, barW = OTA_SPR_W - 32, barH = 18;

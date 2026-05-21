@@ -20,6 +20,13 @@ struct Stats {
   uint8_t  velCount;
   uint8_t  level;
   uint32_t tokens;          // cumulative output tokens, drives level
+  // ESP32-C6 crystal drift in parts per million. Positive = internal
+  // clock runs fast relative to NTP truth. Updated by main.cpp's ntpTick
+  // after each successful sync that has a previous reference point;
+  // smoothed with a 3:1 IIR so single noisy measurements don't whipsaw.
+  // Persisted so the device can apply correction immediately at boot
+  // before the first re-sync lands. 0 means uncalibrated.
+  int32_t  clockDriftPpm;
 };
 
 static Stats _stats;
@@ -35,6 +42,7 @@ inline void statsLoad() {
   _stats.velCount   = _prefs.getUChar("vcnt", 0);
   _stats.level      = _prefs.getUChar("lvl", 0);
   _stats.tokens     = _prefs.getUInt("tok", 0);
+  _stats.clockDriftPpm = _prefs.getInt("drift", 0);
   size_t got = _prefs.getBytes("vel", _stats.velocity, sizeof(_stats.velocity));
   if (got != sizeof(_stats.velocity)) memset(_stats.velocity, 0, sizeof(_stats.velocity));
   _prefs.end();
@@ -55,6 +63,7 @@ inline void statsSave() {
   _prefs.putUChar("vcnt", _stats.velCount);
   _prefs.putUChar("lvl", _stats.level);
   _prefs.putUInt("tok", _stats.tokens);
+  _prefs.putInt("drift", _stats.clockDriftPpm);
   _prefs.putBytes("vel", _stats.velocity, sizeof(_stats.velocity));
   _prefs.end();
   _dirty = false;
@@ -143,6 +152,15 @@ inline bool statsPollLevelUp() {
 }
 
 inline void statsOnDenial() { _stats.denials++; _dirty = true; statsSave(); }
+
+// Record a fresh drift measurement. First non-zero value is taken raw;
+// subsequent measurements feed a 3:1 IIR (75% old, 25% new) so a single
+// outlier (network jitter, sync race) doesn't tank the saved value.
+inline void statsOnClockDrift(int32_t newPpm) {
+  if (_stats.clockDriftPpm == 0) _stats.clockDriftPpm = newPpm;
+  else _stats.clockDriftPpm = (_stats.clockDriftPpm * 3 + newPpm) / 4;
+  _dirty = true; statsSave();
+}
 
 inline void statsMarkDirty() { _dirty = true; }
 
@@ -252,12 +270,9 @@ struct Settings {
   bool hud;
   uint8_t clockRot;  // 0=auto 1=portrait 2=landscape
   uint8_t bright;    // 0..4 → ScreenBreath 20..100 in applyBrightness()
-  int32_t tzOffsetSec; // local timezone offset from UTC (seconds). Updated
-                       // by desktop bridge `time` message; NTP uses it to
-                       // localise time after reboot without a desktop link.
 };
 
-static Settings _settings = { true, true, false, true, true, 0, 4, 0 };
+static Settings _settings = { true, true, false, true, true, 0, 4 };
 
 inline void settingsLoad() {
   _prefs.begin("buddy", true);
@@ -273,7 +288,6 @@ inline void settingsLoad() {
   // brightness change writes the key and it sticks from then on.
   _settings.bright = _prefs.getUChar("s_bright", 4);
   if (_settings.bright > 4) _settings.bright = 4;
-  _settings.tzOffsetSec = _prefs.getInt("s_tz", 0);
   _prefs.end();
 }
 
@@ -286,7 +300,6 @@ inline void settingsSave() {
   _prefs.putBool("s_hud", _settings.hud);
   _prefs.putUChar("s_crot", _settings.clockRot);
   _prefs.putUChar("s_bright", _settings.bright);
-  _prefs.putInt("s_tz", _settings.tzOffsetSec);
   _prefs.end();
 }
 

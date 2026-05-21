@@ -3,6 +3,8 @@
 #include <FS.h>
 #include <esp_mac.h>
 #include <stdarg.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
 // arduino-esp32 v3 dropped the implicit `using fs::File`; pull it back so
 // the upstream `File f = LittleFS.open(...)` style keeps compiling.
 using fs::File;
@@ -114,11 +116,68 @@ static void applyBrightness() { M5.Axp.ScreenBreath(20 + brightLevel * 20); }
 // (defined earlier in the file) can reset the RTC-read cache.
 extern uint32_t _clkLastRead;
 
-// SNTP poller. configTime() in setup() kicks off background acquisition;
-// once `time(NULL)` reports a post-2023 epoch, we apply the saved tz
-// offset, push the local time into M5.Rtc, and flip the data-layer
-// _rtcValid flag. Resyncs hourly afterwards. Runs only while WiFi is up;
-// otherwise no-op.
+// Timezone offset from UTC in seconds. Runtime-only (not persisted) —
+// desktop bridge time message writes this on connect; absent that, we
+// stay at UTC. Saving it would survive reboot but the user explicitly
+// vetoed that — and a fresh boot with WiFi will pick up tz on the next
+// desktop pair anyway.
+int32_t _tzOffsetSec = 0;
+
+// State for NTP drift measurement (also used by correctedTime()).
+static uint32_t _ntpLastSyncMs      = 0;   // millis() right after we applied truth
+static uint32_t _ntpLastSyncSysTime = 0;   // time(NULL) value at that moment
+
+// Apply UTC truth to the system clock + M5.Rtc with the runtime tz applied.
+static void _applyTimeUtc(uint32_t utcEpoch) {
+  time_t local = (time_t)utcEpoch + _tzOffsetSec;
+  struct tm lt; gmtime_r(&local, &lt);
+  RTC_TimeTypeDef tm = { (uint8_t)lt.tm_hour, (uint8_t)lt.tm_min, (uint8_t)lt.tm_sec };
+  RTC_DateTypeDef dt = { (uint8_t)lt.tm_wday, (uint8_t)(lt.tm_mon + 1),
+                         (uint8_t)lt.tm_mday, (uint16_t)(lt.tm_year + 1900) };
+  M5.Rtc.SetTime(&tm);
+  M5.Rtc.SetDate(&dt);
+  _clkLastRead = 0;
+  _rtcValid = true;
+  _ntpLastSyncMs = millis();
+  _ntpLastSyncSysTime = (uint32_t)time(NULL);
+}
+
+// Minimal SNTP/UDP client. Hits pool.ntp.org:123 directly so we get truth
+// on demand instead of relying on configTime's hidden background refresh
+// schedule — that matters for drift measurement, where we need a fresh
+// truth value at a known moment. Returns 0 on failure.
+static uint32_t fetchNtpUtc() {
+  WiFiUDP udp;
+  if (!udp.begin(0)) return 0;
+  IPAddress addr;
+  if (!WiFi.hostByName("pool.ntp.org", addr)) { udp.stop(); return 0; }
+  uint8_t pkt[48] = {0};
+  pkt[0] = 0xE3;   // LI=3 (no warning), VN=4, mode=3 (client)
+  udp.beginPacket(addr, 123);
+  udp.write(pkt, 48);
+  udp.endPacket();
+  uint32_t deadline = millis() + 3000;
+  while ((int32_t)(millis() - deadline) < 0) {
+    int n = udp.parsePacket();
+    if (n >= 48) {
+      udp.read(pkt, 48);
+      udp.stop();
+      uint32_t ntpSec = ((uint32_t)pkt[40] << 24) | ((uint32_t)pkt[41] << 16)
+                     | ((uint32_t)pkt[42] << 8)  | (uint32_t)pkt[43];
+      if (ntpSec < 2208988800UL) return 0;     // malformed / pre-1970
+      return ntpSec - 2208988800UL;
+    }
+    delay(10);
+  }
+  udp.stop();
+  return 0;
+}
+
+// SNTP poller + drift estimator. configTime() in setup() kicks off the
+// arduino-esp32 background SNTP so the first sync lands without us
+// blocking. Once synced, we run our own hourly UDP NTP query — compare
+// the truth against the drifted local time(NULL), compute crystal drift
+// in PPM, smooth into stats().clockDriftPpm and persist.
 static void ntpTick() {
   static uint32_t lastPollMs = 0;
   static bool     synced     = false;
@@ -128,25 +187,61 @@ static void ntpTick() {
   if (lastPollMs && now - lastPollMs < interval) return;
   lastPollMs = now;
 
-  time_t t = time(NULL);
-  if (t < 1700000000) return;   // pre-2023 → SNTP hasn't landed yet
-
-  int32_t tz = settings().tzOffsetSec;
-  time_t local = t + tz;
-  struct tm lt; gmtime_r(&local, &lt);
-  RTC_TimeTypeDef tm = { (uint8_t)lt.tm_hour, (uint8_t)lt.tm_min, (uint8_t)lt.tm_sec };
-  RTC_DateTypeDef dt = { (uint8_t)lt.tm_wday, (uint8_t)(lt.tm_mon + 1),
-                         (uint8_t)lt.tm_mday, (uint16_t)(lt.tm_year + 1900) };
-  M5.Rtc.SetTime(&tm);
-  M5.Rtc.SetDate(&dt);
-  _clkLastRead = 0;
-  _rtcValid = true;
   if (!synced) {
-    Serial.printf("ntp: synced — %04u-%02u-%02u %02u:%02u:%02u (tz %+ld)\n",
-                  lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
-                  lt.tm_hour, lt.tm_min, lt.tm_sec, (long)tz);
+    // Initial sync: rely on configTime() background acquisition. As soon
+    // as time(NULL) crosses a sane epoch threshold we lock in.
+    time_t t = time(NULL);
+    if (t < 1700000000) return;
+    _applyTimeUtc((uint32_t)t);
     synced = true;
+    Serial.printf("ntp: initial sync at utc=%lu (tz %+ld)\n",
+                  (unsigned long)t, (long)_tzOffsetSec);
+    return;
   }
+
+  // Periodic resync: fetch truth via direct UDP NTP, measure drift
+  // against the drifted local time(NULL) BEFORE overwriting it.
+  uint32_t observedLocal = (uint32_t)time(NULL);
+  uint32_t truthUtc      = fetchNtpUtc();
+  if (truthUtc == 0) {
+    Serial.println("ntp: udp query failed, will retry next cycle");
+    return;
+  }
+  uint32_t truthLocal = truthUtc + (uint32_t)_tzOffsetSec;
+  int32_t  driftSec   = (int32_t)observedLocal - (int32_t)truthLocal;
+  // elapsed measured from the *truth* side so it isn't itself drifted
+  int32_t  elapsedSec = (int32_t)truthLocal - (int32_t)_ntpLastSyncSysTime;
+
+  if (elapsedSec >= 60) {
+    int32_t driftPpm = (int32_t)((int64_t)driftSec * 1000000LL / elapsedSec);
+    // Sanity-clamp: real crystals drift ±100 ppm; >1000 ppm is a
+    // measurement artefact (sync race, network jitter) — drop it.
+    if (driftPpm > -1000 && driftPpm < 1000) {
+      statsOnClockDrift(driftPpm);
+      Serial.printf("ntp: resync — drift=%dppm (observed=%lu, truth=%lu, "
+                    "elapsed=%lds, smoothed=%dppm)\n",
+                    driftPpm, (unsigned long)observedLocal,
+                    (unsigned long)truthLocal,
+                    (long)elapsedSec, (int)stats().clockDriftPpm);
+    } else {
+      Serial.printf("ntp: drift %dppm out of range, ignored\n", driftPpm);
+    }
+  }
+  _applyTimeUtc(truthUtc);
+}
+
+// time(NULL) drifts with the crystal between NTP syncs. Apply the
+// learned drift correction so the displayed wall clock matches reality
+// even mid-cycle. Called from clockRefreshRtc().
+static time_t correctedTime() {
+  time_t raw = time(NULL);
+  int32_t drift = stats().clockDriftPpm;
+  if (drift == 0 || _ntpLastSyncMs == 0) return raw;
+  uint32_t elapsedMs = millis() - _ntpLastSyncMs;
+  // Internal clock runs at (1 + drift*1e-6) of true rate, so time(NULL)
+  // has accumulated elapsedMs/1000 * drift/1e6 seconds of excess. Subtract.
+  int64_t correctionSec = -((int64_t)elapsedMs * (int64_t)drift) / 1000000000LL;
+  return raw + correctionSec;
 }
 
 static void wake() {
@@ -431,8 +526,18 @@ static void clockRefreshRtc() {
   if (millis() - _clkLastRead < 1000) return;
   _clkLastRead = millis();
   _onUsb = M5.Axp.GetVBusVoltage() > 4.0f;
-  M5.Rtc.GetTime(&_clkTm);
-  M5.Rtc.GetDate(&_clkDt);
+  // Drift-corrected wall clock. correctedTime() returns the system time
+  // minus accumulated crystal drift since the last NTP sync, so the
+  // clock face stays accurate between hourly resyncs.
+  time_t now = correctedTime();
+  struct tm lt; localtime_r(&now, &lt);
+  _clkTm.Hours   = lt.tm_hour;
+  _clkTm.Minutes = lt.tm_min;
+  _clkTm.Seconds = lt.tm_sec;
+  _clkDt.WeekDay = lt.tm_wday;
+  _clkDt.Month   = lt.tm_mon + 1;
+  _clkDt.Date    = lt.tm_mday;
+  _clkDt.Year    = lt.tm_year + 1900;
 }
 
 static void clockUpdateOrient() {
@@ -1157,12 +1262,13 @@ void setup() {
   wifiLinkInit();
 
   // SNTP: kick off background time fetch. configTime(0,0,...) writes UTC
-  // into the system clock; ntpTick() applies the locale offset (saved by
-  // the desktop bridge into settings().tzOffsetSec) and pushes the result
-  // into M5.Rtc + flips _rtcValid. Multiple servers for redundancy.
+  // into the system clock; ntpTick() applies the locale offset (set on the
+  // runtime _tzOffsetSec global by the desktop bridge) and pushes local
+  // into M5.Rtc + flips _rtcValid. After the initial sync, ntpTick also
+  // runs its own UDP NTP queries hourly to measure crystal drift.
   configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
-  Serial.printf("ntp: SNTP started, tz_offset=%ld sec\n",
-                (long)settings().tzOffsetSec);
+  Serial.printf("ntp: SNTP started, tz_offset=%ld sec, saved drift=%dppm\n",
+                (long)_tzOffsetSec, (int)stats().clockDriftPpm);
 
   // OTA: poll GitHub Releases for newer firmware. First check is delayed
   // 30s after boot so WiFi has a chance to associate; subsequent checks

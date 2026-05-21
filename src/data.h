@@ -92,13 +92,11 @@ static void _applyJson(const char* line, TamaState* out) {
   JsonArray t = doc["time"];
   if (!t.isNull() && t.size() == 2) {
     int32_t tzOff = (int32_t)t[1];
-    // Persist tz offset for the NTP fallback path — once we've seen the
-    // desktop's tz, NTP can localise time across reboots without a desktop
-    // connection. Only write if it changed to spare NVS write cycles.
-    if (settings().tzOffsetSec != tzOff) {
-      settings().tzOffsetSec = tzOff;
-      settingsSave();
-    }
+    // Push tz into the runtime global so ntpTick can localise NTP UTC
+    // for the rest of this boot. Not persisted — fresh boots without a
+    // desktop fall back to UTC display until pair-up.
+    extern int32_t _tzOffsetSec;
+    _tzOffsetSec = tzOff;
     time_t local = (time_t)t[0].as<uint32_t>() + tzOff;
     struct tm lt; gmtime_r(&local, &lt);
     RTC_TimeTypeDef tm = { (uint8_t)lt.tm_hour, (uint8_t)lt.tm_min, (uint8_t)lt.tm_sec };
