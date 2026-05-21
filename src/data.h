@@ -91,7 +91,15 @@ static void _applyJson(const char* line, TamaState* out) {
   // adjusted epoch yields local components including weekday.
   JsonArray t = doc["time"];
   if (!t.isNull() && t.size() == 2) {
-    time_t local = (time_t)t[0].as<uint32_t>() + (int32_t)t[1];
+    int32_t tzOff = (int32_t)t[1];
+    // Persist tz offset for the NTP fallback path — once we've seen the
+    // desktop's tz, NTP can localise time across reboots without a desktop
+    // connection. Only write if it changed to spare NVS write cycles.
+    if (settings().tzOffsetSec != tzOff) {
+      settings().tzOffsetSec = tzOff;
+      settingsSave();
+    }
+    time_t local = (time_t)t[0].as<uint32_t>() + tzOff;
     struct tm lt; gmtime_r(&local, &lt);
     RTC_TimeTypeDef tm = { (uint8_t)lt.tm_hour, (uint8_t)lt.tm_min, (uint8_t)lt.tm_sec };
     RTC_DateTypeDef dt = { (uint8_t)lt.tm_wday, (uint8_t)(lt.tm_mon + 1),

@@ -252,9 +252,12 @@ struct Settings {
   bool hud;
   uint8_t clockRot;  // 0=auto 1=portrait 2=landscape
   uint8_t bright;    // 0..4 → ScreenBreath 20..100 in applyBrightness()
+  int32_t tzOffsetSec; // local timezone offset from UTC (seconds). Updated
+                       // by desktop bridge `time` message; NTP uses it to
+                       // localise time after reboot without a desktop link.
 };
 
-static Settings _settings = { true, true, false, true, true, 0, 4 };
+static Settings _settings = { true, true, false, true, true, 0, 4, 0 };
 
 inline void settingsLoad() {
   _prefs.begin("buddy", true);
@@ -270,6 +273,7 @@ inline void settingsLoad() {
   // brightness change writes the key and it sticks from then on.
   _settings.bright = _prefs.getUChar("s_bright", 4);
   if (_settings.bright > 4) _settings.bright = 4;
+  _settings.tzOffsetSec = _prefs.getInt("s_tz", 0);
   _prefs.end();
 }
 
@@ -282,6 +286,7 @@ inline void settingsSave() {
   _prefs.putBool("s_hud", _settings.hud);
   _prefs.putUChar("s_crot", _settings.clockRot);
   _prefs.putUChar("s_bright", _settings.bright);
+  _prefs.putInt("s_tz", _settings.tzOffsetSec);
   _prefs.end();
 }
 

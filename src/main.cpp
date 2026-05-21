@@ -110,6 +110,45 @@ static bool isFaceDown() {
 
 static void applyBrightness() { M5.Axp.ScreenBreath(20 + brightLevel * 20); }
 
+// _clkLastRead lives below in main.cpp's TU; forward-declare it so ntpTick
+// (defined earlier in the file) can reset the RTC-read cache.
+extern uint32_t _clkLastRead;
+
+// SNTP poller. configTime() in setup() kicks off background acquisition;
+// once `time(NULL)` reports a post-2023 epoch, we apply the saved tz
+// offset, push the local time into M5.Rtc, and flip the data-layer
+// _rtcValid flag. Resyncs hourly afterwards. Runs only while WiFi is up;
+// otherwise no-op.
+static void ntpTick() {
+  static uint32_t lastPollMs = 0;
+  static bool     synced     = false;
+  uint32_t now = millis();
+  if (wifiLinkState() != WLINK_CONNECTED) return;
+  uint32_t interval = synced ? 3600000UL : 2000UL;  // post-sync: 1h; pre: 2s
+  if (lastPollMs && now - lastPollMs < interval) return;
+  lastPollMs = now;
+
+  time_t t = time(NULL);
+  if (t < 1700000000) return;   // pre-2023 → SNTP hasn't landed yet
+
+  int32_t tz = settings().tzOffsetSec;
+  time_t local = t + tz;
+  struct tm lt; gmtime_r(&local, &lt);
+  RTC_TimeTypeDef tm = { (uint8_t)lt.tm_hour, (uint8_t)lt.tm_min, (uint8_t)lt.tm_sec };
+  RTC_DateTypeDef dt = { (uint8_t)lt.tm_wday, (uint8_t)(lt.tm_mon + 1),
+                         (uint8_t)lt.tm_mday, (uint16_t)(lt.tm_year + 1900) };
+  M5.Rtc.SetTime(&tm);
+  M5.Rtc.SetDate(&dt);
+  _clkLastRead = 0;
+  _rtcValid = true;
+  if (!synced) {
+    Serial.printf("ntp: synced — %04u-%02u-%02u %02u:%02u:%02u (tz %+ld)\n",
+                  lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
+                  lt.tm_hour, lt.tm_min, lt.tm_sec, (long)tz);
+    synced = true;
+  }
+}
+
 static void wake() {
   lastInteractMs = millis();
   if (screenOff) {
@@ -731,7 +770,7 @@ void drawInfo() {
     ln("source");
     y += 4;
     spr.setTextColor(p.text, p.bg);
-    ln("github.com/anthropics");
+    ln("github.com/hartmanfrost");
     ln("/claude-desktop-buddy");
     y += 6;
     spr.setTextColor(p.textDim, p.bg);
@@ -1117,6 +1156,14 @@ void setup() {
   // Non-blocking — wifiLinkTick() drives the state machine from loop().
   wifiLinkInit();
 
+  // SNTP: kick off background time fetch. configTime(0,0,...) writes UTC
+  // into the system clock; ntpTick() applies the locale offset (saved by
+  // the desktop bridge into settings().tzOffsetSec) and pushes the result
+  // into M5.Rtc + flips _rtcValid. Multiple servers for redundancy.
+  configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+  Serial.printf("ntp: SNTP started, tz_offset=%ld sec\n",
+                (long)settings().tzOffsetSec);
+
   // OTA: poll GitHub Releases for newer firmware. First check is delayed
   // 30s after boot so WiFi has a chance to associate; subsequent checks
   // run hourly. Manual trigger via {"cmd":"ota"}.
@@ -1160,6 +1207,7 @@ void loop() {
 
   dataPoll(&tama);
   wifiLinkTick();
+  ntpTick();
   otaTick();
 
   // Feed the mood-activity ring on every transcript bump — proxies "Claude
