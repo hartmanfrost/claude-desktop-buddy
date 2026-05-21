@@ -1,5 +1,6 @@
 #include "ota_update.h"
 #include "wifi_link.h"
+#include "character.h"      // characterPalette() for the OTA progress UI
 #include <Arduino.h>
 #include <WiFi.h>
 #include <NetworkClientSecure.h>
@@ -95,35 +96,119 @@ static void _setError(const char* msg) {
   _enter(OTA_ERROR);
 }
 
-// Free heap and quiesce radios before a big TLS+flash download.
+// On-screen OTA status frame. Sprite is kept alive throughout the update
+// so we can paint progress; the main loop's normal draw path doesn't run
+// during the blocking HTTPUpdate.update() call, so our overlay sticks.
+static int     _lastBytesDone  = -1;
+static int     _lastBytesTotal = -1;
+static const char* _lastErrMsg = nullptr;
+
+static void _drawOtaStatus() {
+  const Palette& p = characterPalette();
+  spr.fillSprite(p.bg);
+  spr.setFont(&fonts::Font0);
+  spr.setTextDatum(TC_DATUM);
+
+  // Title.
+  spr.setTextSize(2);
+  spr.setTextColor(p.text, p.bg);
+  spr.drawString("OTA UPDATE", OTA_SPR_W/2, 24);
+
+  // From → to.
+  spr.setTextSize(1);
+  spr.setTextColor(p.textDim, p.bg);
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s -> %s", FIRMWARE_VERSION,
+           _remoteVersion[0] ? _remoteVersion : "?");
+  spr.drawString(buf, OTA_SPR_W/2, 60);
+
+  // Source URL (truncated to one line).
+  spr.setTextColor(p.textDim, p.bg);
+  snprintf(buf, sizeof(buf), "%s/%s", OTA_OWNER, OTA_REPO);
+  spr.drawString(buf, OTA_SPR_W/2, 76);
+
+  // Progress bar.
+  const int barX = 16, barY = 120, barW = OTA_SPR_W - 32, barH = 18;
+  spr.drawRect(barX, barY, barW, barH, p.textDim);
+  int fillW = (int)((uint64_t)(barW - 4) * _progressPct / 100);
+  if (fillW > 0) spr.fillRect(barX + 2, barY + 2, fillW, barH - 4, p.body);
+
+  // Percent (big, under the bar).
+  spr.setTextSize(2);
+  spr.setTextColor(p.text, p.bg);
+  snprintf(buf, sizeof(buf), "%u%%", _progressPct);
+  spr.drawString(buf, OTA_SPR_W/2, barY + barH + 6);
+
+  // Byte counts.
+  spr.setTextSize(1);
+  spr.setTextColor(p.textDim, p.bg);
+  if (_lastBytesDone >= 0 && _lastBytesTotal > 0) {
+    if (_lastBytesTotal >= 1024 * 1024) {
+      snprintf(buf, sizeof(buf), "%d / %d KB",
+               _lastBytesDone / 1024, _lastBytesTotal / 1024);
+    } else {
+      snprintf(buf, sizeof(buf), "%d / %d B",
+               _lastBytesDone, _lastBytesTotal);
+    }
+    spr.drawString(buf, OTA_SPR_W/2, barY + barH + 32);
+  }
+
+  // System info row — free heap + uptime, helps debug stalls.
+  uint32_t heap = ESP.getFreeHeap();
+  snprintf(buf, sizeof(buf), "heap %luK  up %lus",
+           (unsigned long)(heap / 1024),
+           (unsigned long)(millis() / 1000));
+  spr.drawString(buf, OTA_SPR_W/2, barY + barH + 50);
+
+  // State / error band at the bottom.
+  if (_lastErrMsg) {
+    spr.setTextSize(1);
+    spr.setTextColor(0xF800, p.bg);
+    spr.drawString("ERROR", OTA_SPR_W/2, 240);
+    // Word-truncate to fit — error strings are short JSON or HTTP codes.
+    spr.drawString(_lastErrMsg, OTA_SPR_W/2, 256);
+  } else {
+    spr.setTextColor(p.textDim, p.bg);
+    spr.drawString(otaStateName(), OTA_SPR_W/2, 250);
+  }
+
+  spr.setTextDatum(TL_DATUM);  // restore default datum for the rest of the UI
+  spr.pushSprite(0, 0);
+}
+
+// Quiesce + paint initial OTA frame. Sprite is left alive — the LCD shows
+// the update progress until reboot (or restoration on failure).
 static void _quiesceForDownload() {
-  Serial.println("ota: quiescing radios + UI");
-  // Stop advertising so the 100ms broadcast bursts don't compete with the
-  // WiFi RF slots — that's the main coex stall source on ESP32-C6.
-  // Active connections keep working (kept-alive BLE link is cheap); they
-  // simply won't receive any data until reboot since spr is gone.
+  Serial.println("ota: quiescing radios for download");
   NimBLEDevice::stopAdvertising();
-  // Free the 172*320*2 = ~110KB sprite. UI will be blank until reboot
-  // (or restored on error).
-  spr.deleteSprite();
-  delay(150);
+  delay(50);
   Serial.printf("ota: free heap before download = %u\n", ESP.getFreeHeap());
+  _lastBytesDone = 0;
+  _lastBytesTotal = 0;
+  _lastErrMsg = nullptr;
+  _drawOtaStatus();
 }
 
 static void _restoreAfterFailedDownload() {
-  // Best-effort restore so the user can keep using the device after a
-  // failed update attempt.
-  spr.createSprite(OTA_SPR_W, OTA_SPR_H);
+  // Sprite was never deleted; main loop resumes drawing next iteration.
+  // We just need to re-enable BLE advertising. The OTA error frame stays
+  // visible until the main loop's next draw paints over it.
   NimBLEDevice::startAdvertising();
 }
 
 static void _onUpdateProgress(int cur, int total) {
   if (total <= 0) return;
   uint8_t pct = (uint8_t)((uint64_t)cur * 100 / total);
+  _lastBytesDone = cur;
+  _lastBytesTotal = total;
   if (pct != _progressPct) {
     _progressPct = pct;
-    // Throttle log spam — every 10%.
-    if (pct % 10 == 0) Serial.printf("ota: %u%% (%d/%d)\n", pct, cur, total);
+    // Throttle screen redraw + log to every 5% — pushSprite costs ~50ms,
+    // doing it on every chunk would visibly slow the download.
+    if (pct % 5 == 0 || pct == 100) {
+      Serial.printf("ota: %u%% (%d/%d)\n", pct, cur, total);
+      _drawOtaStatus();
+    }
   }
 }
 
@@ -205,6 +290,10 @@ static void _doDownload() {
 
   httpUpdate.setLedPin(-1, LOW);
   httpUpdate.rebootOnUpdate(false);   // we ESP.restart() ourselves
+  // GitHub Releases sends a 302 from github.com → release-assets.github
+  // usercontent.com, and HTTPUpdate refuses redirects by default. FORCE
+  // accepts cross-host hops (STRICT would reject the domain change).
+  httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   httpUpdate.onProgress(_onUpdateProgress);
 
   char url[200];
@@ -217,8 +306,10 @@ static void _doDownload() {
   switch (r) {
     case HTTP_UPDATE_OK:
       Serial.println("ota: update OK, restarting");
+      _progressPct = 100;
+      _drawOtaStatus();              // final 100% frame before reboot
       _enter(OTA_DONE);
-      delay(500);
+      delay(800);
       ESP.restart();
       // not reached
       return;
@@ -230,12 +321,18 @@ static void _doDownload() {
       return;
     case HTTP_UPDATE_FAILED:
     default: {
-      char buf[64];
-      snprintf(buf, sizeof(buf), "update fail %d: %s",
+      snprintf(_lastError, sizeof(_lastError), "code %d: %s",
                (int)httpUpdate.getLastError(),
                httpUpdate.getLastErrorString().c_str());
+      Serial.printf("ota: error: %s\n", _lastError);
+      // Paint the error on screen and hold long enough to read before the
+      // main loop's next draw overwrites it.
+      _lastErrMsg = _lastError;
+      _drawOtaStatus();
+      delay(3000);
+      _lastErrMsg = nullptr;
       _restoreAfterFailedDownload();
-      _setError(buf);
+      _enter(OTA_ERROR);
       return;
     }
   }
