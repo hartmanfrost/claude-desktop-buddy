@@ -35,3 +35,9 @@ const Palette& characterPalette();
 // actually written. Used by main.cpp to maintain the active list of
 // installed GIF packs so nextPet() can cycle through them.
 uint8_t characterListInstalled(char outNames[][24], uint8_t maxN);
+
+// True when the currently-loaded GIF's home-mode rendering overflows
+// the legacy upper 250 px strip — i.e. the pack is tall enough that
+// drawClock should overlay on the pet instead of squeezing the pet
+// into the peek slot above the clock.
+bool characterIsTall();

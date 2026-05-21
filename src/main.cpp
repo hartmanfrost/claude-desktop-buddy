@@ -535,9 +535,9 @@ static void drawMenuHints(const Palette& p, int mx, int mw, int hy,
 static void drawSettings() {
   const Palette& p = characterPalette();
   // When the "ascii pet" row (index 7) is the active selection, expand
-  // the panel by one extra line so the pet's name fits below the
-  // X/Y counter without overlapping the next row ("reset").
-  int extra = (settingsSel == 7) ? MENU_LINE_H : 0;
+  // the panel: 1 line for the pink name + 3 lines for a mini preview
+  // thumbnail rendered via characterRenderTo (peek mode, half-scale).
+  int extra = (settingsSel == 7) ? MENU_LINE_H * 4 : 0;
   int mw = MENU_W, mh = MENU_PAD_TOP * 2 + SETTINGS_N * MENU_LINE_H + MENU_HINT_H + extra;
   int mx = (W - mw) / 2, my = (H - mh) / 2;
   spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
@@ -550,7 +550,7 @@ static void drawSettings() {
     bool sel = (i == settingsSel);
     // Rows after the pet row get pushed down by the extra line so the
     // name slot is reserved between them.
-    int yOff = (i > 7 && settingsSel == 7) ? MENU_LINE_H : 0;
+    int yOff = (i > 7 && settingsSel == 7) ? MENU_LINE_H * 4 : 0;
     int rowY = my + MENU_PAD_TOP + i * MENU_LINE_H + yOff;
     spr.setTextColor(sel ? p.text : p.textDim, PANEL);
     spr.setCursor(mx + 6, rowY);
@@ -585,6 +585,27 @@ static void drawSettings() {
           spr.setTextDatum(TR_DATUM);
           spr.drawString(nm, mx + mw - 6, rowY + MENU_LINE_H);
           spr.setTextDatum(TL_DATUM);
+          // Mini preview of the active pet on the line below the name.
+          // GIF packs render via characterRenderTo (peek path — half-
+          // scale, ~48×50 for a 96×100 source); the box is filled with
+          // the pack's pal.bg first so transparent pixels (rendered as
+          // pal.bg by gifDrawCb) blend with the box, not the menu PANEL.
+          // ASCII species fall back to a body-colour disc placeholder.
+          int boxW = 56, boxH = 56;
+          int boxX = (mw - boxW) / 2 + mx;
+          int boxY = rowY + MENU_LINE_H * 2;
+          if (!buddyMode && characterLoaded()) {
+            uint16_t bg = characterPalette().bg;
+            spr.fillRoundRect(boxX, boxY, boxW, boxH, 3, bg);
+            spr.drawRoundRect(boxX, boxY, boxW, boxH, 3, p.textDim);
+            characterRenderTo(&spr, boxX + boxW/2, boxY + boxH/2);
+          } else if (buddyMode) {
+            uint16_t body = characterPalette().body;
+            spr.fillRoundRect(boxX, boxY, boxW, boxH, 3, PANEL);
+            spr.drawRoundRect(boxX, boxY, boxW, boxH, 3, p.textDim);
+            spr.fillCircle(boxX + boxW/2, boxY + boxH/2, 10, body);
+            spr.drawCircle(boxX + boxW/2, boxY + boxH/2, 10, p.text);
+          }
         }
       }
     }
@@ -751,9 +772,23 @@ static void drawClock() {
 
   if (clockOrient == 0) {
     paintedOrient = 0;
-    // Bottom half — buddy naturally lives at y=0..82, GIF peeks at top
-    // via peek mode. Clearing from 90 leaves both untouched.
-    spr.fillRect(0, 90, W, H - 90, p.bg);
+    const bool tallPet = !buddyMode && characterIsTall();
+    if (!tallPet) {
+      // Short-pack mode (original layout): pet peeks at the top, clock
+      // owns the bottom. Wipe the area below the peek strip cleanly.
+      spr.fillRect(0, 90, W, H - 90, p.bg);
+    } else {
+      // Tall-pack mode (e.g. hoodie): pet keeps the whole panel; clock
+      // overlays the lower band with a stippled dim so the pet stays
+      // readable through the time/date glyphs. Stipple = every other
+      // pixel painted with bg, ~50% perceived dim without an alpha buffer.
+      const int dimY = 170, dimH = 100;
+      for (int y = dimY; y < dimY + dimH; y++) {
+        for (int x = (y & 1); x < W; x += 2) {
+          spr.drawPixel(x, y, p.bg);
+        }
+      }
+    }
     spr.setTextDatum(MC_DATUM);
     // Sizes bumped one step (4→5, 2→3) and y positions stretched into the
     // taller 320 px panel. HH:MM at size 5 = 5 chars × 30 px = 150 px,
@@ -1907,7 +1942,11 @@ void loop() {
   static bool wasClocking = false;
   static bool wasLandscape = false;
   if (clocking != wasClocking || landscapeClock != wasLandscape) {
-    if (clocking && !landscapeClock) characterSetPeek(true);
+    // Tall packs (e.g. hoodie at 2×=434 px) lose their face in peek
+    // mode — half-scale shrinks them into the 70 px header strip and
+    // there's no room. For those we keep the home-size GIF and let
+    // drawClock paint a dimmed overlay on top instead.
+    if (clocking && !landscapeClock && !characterIsTall()) characterSetPeek(true);
     else applyDisplayMode();
     characterInvalidate();
     if (buddyMode) buddyInvalidate();

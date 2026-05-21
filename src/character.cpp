@@ -49,11 +49,12 @@ static bool        peekMode = false;
 // Draw target — defaults to the sprite; characterRenderTo() retargets to
 // M5.Lcd for the landscape clock (both inherit TFT_eSPI).
 static TFT_eSPI*   _tgt = &spr;
-// Dynamic home-mode scale. Different character packs ship at different
-// canvas sizes: bufo/clawd/cogito at 96×100 (fit 2× on a 172×320 panel),
-// hoodie at 96×217 (doesn't fit 2× — and even 1× was clipped by the old
-// fixed-250 home strip). gifScaleNum/Den is computed per-pack when the
-// GIF opens and applied identically in gifPlace + gifDrawCb.
+// Home-mode scale. Bufo/clawd/cogito are 96×100 — 2× upscale (192×200)
+// clips ~10 px on each side of the 172 px panel but the art is centred
+// in its canvas so the lost pixels are background. Hoodie is 96×217 —
+// 2× would be 192×434 which is taller than the panel; we still go 2×
+// but anchor at the top so the face stays visible and the bottom of
+// the legs clips off-panel.
 //
 // num/den convention:
 //   num >= 1, den == 1 → integer upscale  (e.g. 2/1 = 2× bigger)
@@ -61,28 +62,35 @@ static TFT_eSPI*   _tgt = &spr;
 static int8_t gifScaleNum = 2;
 static int8_t gifScaleDen = 1;
 
+// Cached "tall pack" flag for the rest of the rendering pipeline. True
+// when the upscaled pet would overflow the old home strip (y=0..250);
+// drawClock checks this to decide between peek-and-big-clock vs full-
+// size-pet-with-clock-overlay.
+static bool   gifTallHome = false;
+static const int HOME_AREA_H = 250;   // legacy home strip — used for short-pet vertical centring
+
 static void gifComputeScale() {
-  const int W = spr.width(), H = spr.height();
-  // Try the largest integer upscale that still fits both dimensions.
-  for (int s = 4; s >= 1; s--) {
-    if (gifW * s <= W && gifH * s <= H) {
-      gifScaleNum = s; gifScaleDen = 1; return;
-    }
+  const int H = spr.height();
+  // Always aim for 2× — that's what the original firmware did and what
+  // every bundled pack was authored against. If even 2× is too tall to
+  // fit the panel with some headroom, allow 1×. Beyond that, downscale.
+  if (gifH * 2 <= H) {
+    gifScaleNum = 2; gifScaleDen = 1; return;
   }
-  // Native (1×) still too big — pick the smallest downscale that fits.
+  if (gifH <= H) {
+    gifScaleNum = 1; gifScaleDen = 1; return;
+  }
   for (int s = 2; s <= 8; s++) {
-    if (gifW <= W * s && gifH <= H * s) {
-      gifScaleNum = 1; gifScaleDen = s; return;
-    }
+    if (gifH <= H * s) { gifScaleNum = 1; gifScaleDen = s; return; }
   }
-  // Last-resort fallback: 1× with edge clipping.
   gifScaleNum = 1; gifScaleDen = 1;
 }
 
 // Peek mode renders at half scale (2:1 nearest-neighbor in gifDrawCb)
-// so the whole pet fits the 70 px peek window. Home mode uses the full
-// 320 px panel height — HUD transcript at the bottom just overlays the
-// GIF, so a tall pack like hoodie gets the breathing room it needs.
+// so the whole pet fits the 70 px peek window. Home mode places short
+// packs in the upper 250 px (original behaviour — keeps a clear band
+// for the HUD transcript); tall packs anchor 16 px from the top and
+// clip into the HUD area, which the HUD then overlays.
 static void gifPlace() {
   int outW, outH;
   if (peekMode) {
@@ -91,10 +99,19 @@ static void gifPlace() {
     outW = (gifW * gifScaleNum) / gifScaleDen;
     outH = (gifH * gifScaleNum) / gifScaleDen;
   }
-  gifX = (spr.width()  - outW) / 2;
-  gifY = peekMode ? (PEEK_TOP - outH) / 2
-                  : (spr.height() - outH) / 2;
+  gifX = (spr.width() - outW) / 2;
+  if (peekMode) {
+    gifY = (PEEK_TOP - outH) / 2;
+  } else if (outH <= HOME_AREA_H) {
+    gifTallHome = false;
+    gifY = (HOME_AREA_H - outH) / 2;        // legacy upper-strip centre
+  } else {
+    gifTallHome = true;
+    gifY = 16;                              // anchor at top, bottom clips
+  }
 }
+
+bool characterIsTall() { return gifTallHome; }
 static uint32_t    nextFrameAt = 0;
 static uint32_t    animPauseUntil = 0;
 static uint32_t    variantStartedMs = 0;
