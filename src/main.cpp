@@ -1503,7 +1503,22 @@ void drawHUD() {
   // height (13 px glyphs).
   const int SHOW = 3, LH = 14, WIDTH = 20;
   const int AREA = SHOW * LH + 4;
-  spr.fillRect(0, H - AREA, W, AREA, p.bg);
+  // For tall packs (hoodie reaches into this strip at 2× scale) we
+  // don't want to wipe the pet — instead lay down a stippled half-
+  // alpha veil (every other pixel set to pal.bg) so the pet stays
+  // visible through the text. Per-glyph opaque bg from setTextColor
+  // below still gives the text proper legibility on top. Short packs
+  // never paint into this band, so the cheaper fillRect is fine.
+  bool petUnderHud = !buddyMode && characterIsTall();
+  if (petUnderHud) {
+    for (int y = H - AREA; y < H; y++) {
+      for (int x = (y & 1); x < W; x += 2) {
+        spr.drawPixel(x, y, p.bg);
+      }
+    }
+  } else {
+    spr.fillRect(0, H - AREA, W, AREA, p.bg);
+  }
   spr.setFont(&m5CyrillicFont());
   spr.setTextSize(1);
 
