@@ -114,33 +114,36 @@ void refreshGifList() {
   if (gifIdx >= gifCount) gifIdx = 0;
 }
 
-// Cycle GIF[0..M-1] → ASCII species 0..N-1 → GIF[0]. The combined
-// position is gifIdx-or-species-idx; the persisted "species" NVS key
-// stays 0xFF whenever we're on any GIF, and the GIF index itself
-// persists under the new "gif" key.
+// Cycle ASCII species 0..N-1 → GIF[0..M-1] → species 0. Species lead
+// the list (matches upstream's original ordering). Combined position
+// for the info-page counter: species → 1..N, GIFs → N+1..N+M.
+// NVS "species" key stays 0xFF while on any GIF; "gif" holds the index.
 static void nextPet() {
   uint8_t nSp = buddySpeciesCount();
-  if (!buddyMode) {
-    // Currently on a GIF — advance within the GIF pool first.
+  if (buddyMode) {
+    // Currently on ASCII species — advance within the species pool.
+    if (buddySpeciesIdx() + 1 < nSp) {
+      buddyNextSpecies();
+    } else if (gifAvailable) {
+      // Past the last species → jump to GIF 0.
+      buddyMode = false;
+      gifIdx = 0;
+      gifIdxSave(0);
+      speciesIdxSave(SPECIES_GIF);
+      characterInit(gifNames[gifIdx]);
+    }
+  } else {
+    // Currently on a GIF — advance within the GIF pool.
     if (gifIdx + 1 < gifCount) {
       gifIdx++;
       gifIdxSave(gifIdx);
       characterInit(gifNames[gifIdx]);
     } else {
-      // Past the last GIF → jump to species 0.
+      // Past the last GIF → wrap back to species 0.
       buddyMode = true;
       buddySetSpeciesIdx(0);
       speciesIdxSave(0);
     }
-  } else if (buddySpeciesIdx() + 1 >= nSp && gifAvailable) {
-    // Past the last species → wrap back to GIF[0].
-    buddyMode = false;
-    gifIdx = 0;
-    gifIdxSave(0);
-    speciesIdxSave(SPECIES_GIF);
-    characterInit(gifNames[gifIdx]);
-  } else {
-    buddyNextSpecies();
   }
   characterInvalidate();
   if (buddyMode) buddyInvalidate();
@@ -531,7 +534,11 @@ static void drawMenuHints(const Palette& p, int mx, int mw, int hy,
 
 static void drawSettings() {
   const Palette& p = characterPalette();
-  int mw = MENU_W, mh = MENU_PAD_TOP * 2 + SETTINGS_N * MENU_LINE_H + MENU_HINT_H;
+  // When the "ascii pet" row (index 7) is the active selection, expand
+  // the panel by one extra line so the pet's name fits below the
+  // X/Y counter without overlapping the next row ("reset").
+  int extra = (settingsSel == 7) ? MENU_LINE_H : 0;
+  int mw = MENU_W, mh = MENU_PAD_TOP * 2 + SETTINGS_N * MENU_LINE_H + MENU_HINT_H + extra;
   int mx = (W - mw) / 2, my = (H - mh) / 2;
   spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
   spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
@@ -541,11 +548,15 @@ static void drawSettings() {
   bool vals[] = { s.sound, s.bt, s.wifi, s.led, s.hud };
   for (int i = 0; i < SETTINGS_N; i++) {
     bool sel = (i == settingsSel);
+    // Rows after the pet row get pushed down by the extra line so the
+    // name slot is reserved between them.
+    int yOff = (i > 7 && settingsSel == 7) ? MENU_LINE_H : 0;
+    int rowY = my + MENU_PAD_TOP + i * MENU_LINE_H + yOff;
     spr.setTextColor(sel ? p.text : p.textDim, PANEL);
-    spr.setCursor(mx + 6, my + MENU_PAD_TOP + i * MENU_LINE_H);
+    spr.setCursor(mx + 6, rowY);
     spr.print(sel ? "> " : "  ");
     spr.print(settingsItems[i]);
-    spr.setCursor(mx + mw - 42, my + MENU_PAD_TOP + i * MENU_LINE_H);
+    spr.setCursor(mx + mw - 42, rowY);
     spr.setTextColor(p.textDim, PANEL);
     if (i == 0) {
       spr.printf("%u/4", brightLevel);
@@ -556,11 +567,26 @@ static void drawSettings() {
       static const char* const RN[] = { "auto", "port", "land" };
       spr.print(RN[s.clockRot]);
     } else if (i == 7) {
-      // Combined position across all GIF packs + ASCII species.
-      uint8_t total = buddySpeciesCount() + gifCount;
-      uint8_t pos   = buddyMode ? (gifCount + buddySpeciesIdx() + 1)
-                                : (gifIdx + 1);
+      // Combined position: species 1..nSp first, then GIFs nSp+1..nSp+M.
+      uint8_t nSp   = buddySpeciesCount();
+      uint8_t total = nSp + gifCount;
+      uint8_t pos   = buddyMode ? (buddySpeciesIdx() + 1)
+                                : (nSp + gifIdx + 1);
       spr.printf("%u/%u", pos, total);
+      // Pet name on the next line, right-aligned, in pink. Only shown
+      // when the row is the active selection so the menu stays compact
+      // when the user isn't hovering the pet picker.
+      if (sel) {
+        const char* nm = buddyMode ? buddySpeciesName()
+                                   : (gifCount > 0 ? gifNames[gifIdx] : "");
+        if (nm && *nm) {
+          static const uint16_t PINK = 0xFB14;   // RGB565 ≈ #F86CA0, soft hot-pink
+          spr.setTextColor(PINK, PANEL);
+          spr.setTextDatum(TR_DATUM);
+          spr.drawString(nm, mx + mw - 6, rowY + MENU_LINE_H);
+          spr.setTextDatum(TL_DATUM);
+        }
+      }
     }
   }
   spr.setFont(&fonts::Font0);
@@ -1373,6 +1399,11 @@ static void drawSlot() {
 
   spr.setFont(&m5CyrillicFont());
   spr.setTextSize(4);
+  // Use MC_DATUM (middle-centre) instead of the TC_DATUM inherited from
+  // the title above — TC put the glyph top at y, which slid the symbol
+  // about half a glyph height below the box. MC anchors the visual
+  // centre of the digit on the box centre.
+  spr.setTextDatum(MC_DATUM);
   for (int i = 0; i < 3; i++) {
     int x = startX + i * (boxW + gap);
     spr.fillRoundRect(x, boxY, boxW, boxH, 4, p.bg);
@@ -1381,8 +1412,9 @@ static void drawSlot() {
     spr.drawRoundRect(x, boxY, boxW, boxH, 4, border);
     spr.setTextColor(p.text, p.bg);
     char sym[2] = { SLOT_SYMBOLS[slotReel[i]], 0 };
-    spr.drawString(sym, x + boxW/2, boxY + boxH/2 + 2);
+    spr.drawString(sym, x + boxW/2, boxY + boxH/2);
   }
+  spr.setTextDatum(TC_DATUM);   // restore for the labels below
 
   // Status line under the reels.
   spr.setFont(&fonts::Font0);

@@ -49,21 +49,51 @@ static bool        peekMode = false;
 // Draw target — defaults to the sprite; characterRenderTo() retargets to
 // M5.Lcd for the landscape clock (both inherit TFT_eSPI).
 static TFT_eSPI*   _tgt = &spr;
-// Home-mode scale factor — character packs were authored for the 135 px
-// M5StickC and look tiny on our 172×320 Waveshare panel. Upscale 2× and
-// allow horizontal clipping; the bundled bufo art is well-centered in
-// its 96×100 canvas so the lost edges are background pixels.
-static const int   HOME_SCALE = 2;
+// Dynamic home-mode scale. Different character packs ship at different
+// canvas sizes: bufo/clawd/cogito at 96×100 (fit 2× on a 172×320 panel),
+// hoodie at 96×217 (doesn't fit 2× — and even 1× was clipped by the old
+// fixed-250 home strip). gifScaleNum/Den is computed per-pack when the
+// GIF opens and applied identically in gifPlace + gifDrawCb.
+//
+// num/den convention:
+//   num >= 1, den == 1 → integer upscale  (e.g. 2/1 = 2× bigger)
+//   num == 1, den >= 2 → integer downscale (e.g. 1/2 = half-size)
+static int8_t gifScaleNum = 2;
+static int8_t gifScaleDen = 1;
+
+static void gifComputeScale() {
+  const int W = spr.width(), H = spr.height();
+  // Try the largest integer upscale that still fits both dimensions.
+  for (int s = 4; s >= 1; s--) {
+    if (gifW * s <= W && gifH * s <= H) {
+      gifScaleNum = s; gifScaleDen = 1; return;
+    }
+  }
+  // Native (1×) still too big — pick the smallest downscale that fits.
+  for (int s = 2; s <= 8; s++) {
+    if (gifW <= W * s && gifH <= H * s) {
+      gifScaleNum = 1; gifScaleDen = s; return;
+    }
+  }
+  // Last-resort fallback: 1× with edge clipping.
+  gifScaleNum = 1; gifScaleDen = 1;
+}
+
 // Peek mode renders at half scale (2:1 nearest-neighbor in gifDrawCb)
-// so the whole pet fits the 70 px peek window. Home mode scales up.
+// so the whole pet fits the 70 px peek window. Home mode uses the full
+// 320 px panel height — HUD transcript at the bottom just overlays the
+// GIF, so a tall pack like hoodie gets the breathing room it needs.
 static void gifPlace() {
-  int outW = peekMode ? gifW / 2 : gifW * HOME_SCALE;
-  int outH = peekMode ? gifH / 2 : gifH * HOME_SCALE;
-  gifX = (spr.width() - outW) / 2;
-  // Home mode uses the upper ~250 px of the panel (everything above the
-  // 40 px HUD strip). gifY can go negative when outH would exceed that —
-  // gifDrawCb clips per-pixel below.
-  gifY = peekMode ? (PEEK_TOP - outH) / 2 : (250 - outH) / 2;
+  int outW, outH;
+  if (peekMode) {
+    outW = gifW / 2; outH = gifH / 2;
+  } else {
+    outW = (gifW * gifScaleNum) / gifScaleDen;
+    outH = (gifH * gifScaleNum) / gifScaleDen;
+  }
+  gifX = (spr.width()  - outW) / 2;
+  gifY = peekMode ? (PEEK_TOP - outH) / 2
+                  : (spr.height() - outH) / 2;
 }
 static uint32_t    nextFrameAt = 0;
 static uint32_t    animPauseUntil = 0;
@@ -136,12 +166,27 @@ static void gifDrawCb(GIFDRAW* d) {
     return;
   }
 
-  // Home mode: HOME_SCALE × upscale (default 2×). Each source pixel
-  // writes a HOME_SCALE × HOME_SCALE block. Horizontal clipping happens
-  // per-pixel because the bufo-sized GIF (96×100 → 192×200) is wider
-  // than the 172 px panel at 2×; we lose ~10 px of background on each
-  // side, the character itself stays centered.
-  const int S = HOME_SCALE;
+  // Home mode: scale by gifScaleNum / gifScaleDen, computed per-pack
+  // in gifComputeScale(). Upscale path expands each source pixel into
+  // an N×N block; downscale path samples every D-th row/col (mirrors
+  // the peek path's halving). HUD transcript renders later in the
+  // frame so a tall GIF that reaches the bottom of the panel just
+  // gets the text overlaid on top — no implicit reserved strip.
+  if (gifScaleDen > 1) {
+    const int D = gifScaleDen;
+    if (srcY % D != 0) return;
+    int y = gifY + srcY / D;
+    if (y < 0 || y >= spr.height()) return;
+    int x0 = gifX + d->iX / D;
+    int w  = d->iWidth / D;
+    for (int i = 0; i < w; i++) {
+      int xx = x0 + i;
+      if (xx < 0 || xx >= spr.width()) continue;
+      put(xx, y, src[i * D]);
+    }
+    return;
+  }
+  const int S = gifScaleNum;
   int y0 = gifY + srcY * S;
   if (y0 + S <= 0 || y0 >= spr.height()) return;
   int x0 = gifX + d->iX * S;
@@ -369,6 +414,9 @@ void characterSetState(uint8_t s) {
     gifOpen = true;
     gifW = gif.getCanvasWidth();
     gifH = gif.getCanvasHeight();
+    // Pick the integer scale (up or down) that fits this canvas into
+    // the panel before deciding placement coordinates.
+    gifComputeScale();
     gifPlace();
     spr.fillSprite(pal.bg);   // bias upward, leave room for HUD
     nextFrameAt = 0;
