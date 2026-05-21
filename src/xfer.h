@@ -300,12 +300,15 @@ inline bool xferCommand(JsonDocument& doc) {
       return true;
     }
 
-    // Non-config file → first one in the transfer triggers the character
-    // wipe + mkdir. Existing character is closed so its GIF handles drop.
+    // Non-config file → first one in the transfer prepares ONLY the
+    // destination pack dir (not the whole /characters/ tree). Existing
+    // packs stay so the device accumulates a roster instead of swapping.
+    // If a pack with the same name was already there, its old files get
+    // cleared to avoid orphaned mixed content; other dirs are untouched.
     if (!_xCharWiped) {
-      characterClose();
-      _xWipeAllChars();
-      char dir[48]; snprintf(dir, sizeof(dir), "/characters/%s", _xCharName);
+      characterClose();          // drops GIF handles in case we're replacing the active pack
+      char dir[64]; snprintf(dir, sizeof(dir), "/characters/%s", _xCharName);
+      _xWipeDir(dir);            // no-op if absent, mkdir + clear if present
       LittleFS.mkdir(dir);
       _xCharWiped = true;
     }
@@ -347,11 +350,15 @@ inline bool xferCommand(JsonDocument& doc) {
       extern bool buddyMode, gifAvailable;
       extern void refreshGifList();
       extern uint8_t gifIdx;
+      extern char gifNames[][24];
+      extern uint8_t gifCount;
       if (ok) {
-        // The wipe + new upload means /characters/ now holds exactly
-        // one pack — refresh the list and point gifIdx at it.
+        // Other packs are preserved now — refresh the list and walk it
+        // to find which slot the new pack landed in.
         refreshGifList();
-        gifIdx = 0;
+        for (uint8_t i = 0; i < gifCount; i++) {
+          if (strcmp(gifNames[i], _xCharName) == 0) { gifIdx = i; break; }
+        }
         buddyMode = false;
         speciesIdxSave(0xFF);
       }

@@ -86,9 +86,9 @@ const uint8_t SPECIES_GIF = 0xFF;   // species NVS sentinel: use a GIF pack
 // bundled (bufo, cogito, clawd, hoodie) plus optional user uploads we
 // cap at 8 — plenty of headroom, and the names array is fixed-size to
 // avoid heap fragmentation on a long-running device.
-static const uint8_t GIFS_MAX = 8;
-static char     gifNames[GIFS_MAX][24];
-static uint8_t  gifCount = 0;
+const uint8_t   GIFS_MAX = 8;
+char            gifNames[GIFS_MAX][24];   // external linkage — xfer.h scans this after folder push
+uint8_t         gifCount = 0;
 uint8_t         gifIdx   = 0;             // external linkage — xfer.h patches it after folder push
 
 // Persisted GIF selection — Preferences NVS, namespace "buddy", key "gif".
