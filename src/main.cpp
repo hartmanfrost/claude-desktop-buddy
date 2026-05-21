@@ -65,7 +65,7 @@ uint8_t menuSel     = 0;
 uint8_t brightLevel = 4;           // 0..4 → ScreenBreath 20..100
 bool    btnALong    = false;
 
-enum DisplayMode { DISP_NORMAL, DISP_PET, DISP_INFO, DISP_COUNT };
+enum DisplayMode { DISP_NORMAL, DISP_PET, DISP_INFO, DISP_SLOT, DISP_COUNT };
 uint8_t displayMode = DISP_NORMAL;
 uint8_t infoPage = 0;
 uint8_t petPage = 0;
@@ -1250,6 +1250,116 @@ void drawPet() {
   spr.setFont(&fonts::Font0);
 }
 
+// ─── ASCII slot machine (DISP_SLOT) ────────────────────────────────────────
+// Easter-egg one-armed bandit. Enter via the tap-cycle through display
+// modes (it sits after DISP_INFO). Inside DISP_SLOT, long-press = spin,
+// short tap = exit to the next display mode like everywhere else.
+//
+// Mechanics: three independent reels, each settles at a different
+// timestamp so the human gets the satisfying clack-clack-clack feel.
+// Three-of-a-kind triggers a P_CELEBRATE one-shot so the pet joins in.
+static const char SLOT_SYMBOLS[] = "7$C*?@";   // 6 symbols, including 'C' for Claude
+static const uint8_t SLOT_N_SYMBOLS = sizeof(SLOT_SYMBOLS) - 1;
+static uint8_t  slotReel[3]     = {0, 0, 0};
+static uint32_t slotStopMs[3]   = {0, 0, 0};
+static bool     slotSpinning    = false;
+static bool     slotWinPending  = false;   // true between settle and next spin
+static uint32_t slotLastWinMs   = 0;
+
+static void slotStartSpin() {
+  if (slotSpinning) return;
+  uint32_t now = millis();
+  slotSpinning   = true;
+  slotWinPending = false;
+  // Stagger reel-stops 600 ms apart. Final reel takes 2s total — fast
+  // enough not to bore, long enough that the suspense lands.
+  slotStopMs[0] = now + 800;
+  slotStopMs[1] = now + 1400;
+  slotStopMs[2] = now + 2000;
+}
+
+static void slotTick() {
+  if (!slotSpinning) return;
+  uint32_t now = millis();
+  bool allStopped = true;
+  for (uint8_t i = 0; i < 3; i++) {
+    if ((int32_t)(now - slotStopMs[i]) < 0) {
+      // Cycle every 80 ms while spinning — blurry but readable
+      slotReel[i] = (uint8_t)((now / 80 + i * 2) % SLOT_N_SYMBOLS);
+      allStopped = false;
+    } else if ((int32_t)(now - slotStopMs[i]) < 100) {
+      // Lock in the final symbol exactly once at stop time. random8() so
+      // results don't correlate to the spin start time.
+      slotReel[i] = (uint8_t)(esp_random() % SLOT_N_SYMBOLS);
+    }
+  }
+  if (allStopped) {
+    slotSpinning   = false;
+    slotWinPending = (slotReel[0] == slotReel[1] && slotReel[1] == slotReel[2]);
+    if (slotWinPending) {
+      slotLastWinMs = now;
+      triggerOneShot(P_CELEBRATE, 3000);
+      beep(2600, 120);
+    } else {
+      beep(900, 60);
+    }
+  }
+}
+
+static void drawSlot() {
+  const Palette& p = characterPalette();
+  spr.fillSprite(p.bg);
+
+  // Title, top-centre under the bezel margin.
+  spr.setFont(&fonts::Font0);
+  spr.setTextSize(2);
+  spr.setTextColor(p.text, p.bg);
+  spr.setTextDatum(TC_DATUM);
+  spr.drawString("SLOT", W/2, 20);
+
+  // 3 reels in a centered row. Box ~46x68, gap 8 → total width 154, fits 172.
+  const int boxW = 46, boxH = 68, gap = 8;
+  const int totalW = boxW * 3 + gap * 2;
+  const int startX = (W - totalW) / 2;
+  const int boxY = 110;
+
+  spr.setFont(&m5CyrillicFont());
+  spr.setTextSize(4);
+  for (int i = 0; i < 3; i++) {
+    int x = startX + i * (boxW + gap);
+    spr.fillRoundRect(x, boxY, boxW, boxH, 4, p.bg);
+    uint16_t border = slotSpinning ? p.body
+                    : (slotWinPending ? GREEN : p.textDim);
+    spr.drawRoundRect(x, boxY, boxW, boxH, 4, border);
+    spr.setTextColor(p.text, p.bg);
+    char sym[2] = { SLOT_SYMBOLS[slotReel[i]], 0 };
+    spr.drawString(sym, x + boxW/2, boxY + boxH/2 + 2);
+  }
+
+  // Status line under the reels.
+  spr.setFont(&fonts::Font0);
+  spr.setTextSize(2);
+  if (slotSpinning) {
+    spr.setTextColor(p.textDim, p.bg);
+    spr.drawString("spinning...", W/2, 210);
+  } else if (slotWinPending) {
+    // Blink JACKPOT for the first 3 seconds after a win
+    bool on = ((millis() / 250) & 1) || (millis() - slotLastWinMs > 3000);
+    spr.setTextColor(on ? GREEN : p.bg, p.bg);
+    spr.drawString("JACKPOT!", W/2, 210);
+  } else {
+    spr.setTextColor(p.textDim, p.bg);
+    spr.drawString("pull lever", W/2, 210);
+  }
+
+  // Hint at bottom.
+  spr.setTextSize(1);
+  spr.setTextColor(p.textDim, p.bg);
+  spr.drawString("hold = spin", W/2, 270);
+  spr.drawString("tap = next page", W/2, 284);
+  spr.setTextDatum(TL_DATUM);
+}
+
 void drawHUD() {
   if (tama.promptId[0]) { drawApproval(); return; }
   const Palette& p = characterPalette();
@@ -1419,6 +1529,7 @@ void loop() {
   ntpTick();
   geoipTick();
   otaTick();
+  slotTick();
 
   // Feed the mood-activity ring on every transcript bump — proxies "Claude
   // is talking to me" when there are no approvals to time.
@@ -1663,6 +1774,12 @@ void loop() {
       beep(2400, 30);
       petPage = (petPage + 1) % PET_PAGES;
       applyDisplayMode();
+    } else if (displayMode == DISP_SLOT) {
+      // Slot machine: hold = pull the lever. Beep deferred — slotTick
+      // fires the win/loss tone when reels settle, lever-press itself
+      // gets a softer click.
+      beep(1600, 40);
+      slotStartSpin();
     } else {
       beep(2400, 30);
       msgScroll = (msgScroll >= 30) ? 0 : msgScroll + 1;
@@ -1808,6 +1925,7 @@ void loop() {
       else if (clocking) drawClock();
       else if (displayMode == DISP_INFO) drawInfo();
       else if (displayMode == DISP_PET) drawPet();
+      else if (displayMode == DISP_SLOT) drawSlot();
       else if (settings().hud) drawHUD();
       if (resetOpen) drawReset();
       else if (settingsOpen) drawSettings();

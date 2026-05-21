@@ -1,0 +1,26 @@
+{
+  "name": "cogito",
+  "colors": {
+    "body": "#B2BCBF",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "textDim": "#808080",
+    "ink": "#050607"
+  },
+  "states": {
+    "sleep": "sleep.gif",
+    "idle": [
+      "idle_0.gif",
+      "idle_1.gif",
+      "idle_2.gif",
+      "idle_3.gif",
+      "idle_4.gif",
+      "idle_5.gif"
+    ],
+    "busy": "busy.gif",
+    "attention": "attention.gif",
+    "celebrate": "celebrate.gif",
+    "dizzy": "dizzy.gif",
+    "heart": "heart.gif"
+  }
+}

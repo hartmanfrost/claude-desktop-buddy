@@ -90,6 +90,18 @@ jobs:
           cp .pio/build/waveshare-esp32-c6/firmware.bin   dist/firmware-waveshare-c6.bin
           cp .pio/build/waveshare-esp32-c6/bootloader.bin dist/bootloader.bin
           cp .pio/build/waveshare-esp32-c6/partitions.bin dist/partitions.bin
+          # Optional character packs — bundle the GIF folders from
+          # characters/ into a single zip so users can grab the lot and
+          # drop individual folders onto Hardware Buddy. bufo is shipped
+          # in the LittleFS image itself; this asset is the alternates
+          # (cogito, clawd, hoodie, …).
+          if [ -d characters ]; then
+            extras=$(ls characters/ | grep -v '^bufo$' | grep -v '\.' || true)
+            if [ -n "$extras" ]; then
+              (cd characters && zip -qr ../dist/character-packs.zip $extras)
+              ls -lh dist/character-packs.zip
+            fi
+          fi
           ls -lh dist/
           sha256sum dist/* > dist/SHA256SUMS.txt
           cat dist/SHA256SUMS.txt
@@ -108,9 +120,12 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ${{ steps.ver.outputs.tag }}
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          # character-packs.zip is optional — skip when characters/ has
+          # nothing but the LittleFS-bundled bufo.
+          fail_on_unmatched_files: false
           files: |
             dist/firmware-waveshare-c6.bin
             dist/bootloader.bin
             dist/partitions.bin
             dist/SHA256SUMS.txt
+            dist/character-packs.zip
