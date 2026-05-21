@@ -1259,14 +1259,17 @@ void drawHUD() {
   // valid (NTP / desktop has synced). Cleared each frame so character
   // particles (Zzz, hearts) don't bleed over.
   if (dataRtcValid()) {
-    const int CW = 34, CH = 10;
-    spr.fillRect((W - CW) / 2, 0, CW, CH, p.bg);
+    // Font0 size 1 glyphs are 8 px tall. Top y=2 placed the digits
+    // under the rounded-corner bezel band; nudge down by ~half a glyph
+    // (4 px) so the readout clears the curve.
+    const int CW = 34, CH = 12;
+    spr.fillRect((W - CW) / 2, 4, CW, CH, p.bg);
     spr.setFont(&fonts::Font0);
     spr.setTextSize(1);
     spr.setTextColor(p.textDim, p.bg);
     spr.setTextDatum(TC_DATUM);
     char hm[8]; snprintf(hm, sizeof(hm), "%02u:%02u", _clkTm.Hours, _clkTm.Minutes);
-    spr.drawString(hm, W / 2, 2);
+    spr.drawString(hm, W / 2, 6);
     spr.setTextDatum(TL_DATUM);
   }
   // u8g2 8x13 monospace Cyrillic font. 172 px / 8 = 21 chars per row.
