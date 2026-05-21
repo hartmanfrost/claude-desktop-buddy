@@ -70,20 +70,14 @@ static bool   gifTallHome = false;
 static const int HOME_AREA_H = 250;   // legacy home strip — used for short-pet vertical centring
 
 static void gifComputeScale() {
-  const int H = spr.height();
-  // Always aim for 2× — that's what the original firmware did and what
-  // every bundled pack was authored against. If even 2× is too tall to
-  // fit the panel with some headroom, allow 1×. Beyond that, downscale.
-  if (gifH * 2 <= H) {
-    gifScaleNum = 2; gifScaleDen = 1; return;
-  }
-  if (gifH <= H) {
-    gifScaleNum = 1; gifScaleDen = 1; return;
-  }
-  for (int s = 2; s <= 8; s++) {
-    if (gifH <= H * s) { gifScaleNum = 1; gifScaleDen = s; return; }
-  }
-  gifScaleNum = 1; gifScaleDen = 1;
+  // Hard-pin 2× upscale — that's what every bundled pack was authored
+  // for. Tall packs (hoodie at 2× = 192×434 vs 320 panel) clip
+  // vertically below the panel; gifPlace anchors them at the top so
+  // the face stays visible and the bottom of the body clips into the
+  // HUD strip, which then overlays on top via the normal draw order.
+  // Genuinely-tiny GIFs and absurdly-large ones would deserve a real
+  // fit-search, but none of the current packs need it.
+  gifScaleNum = 2; gifScaleDen = 1;
 }
 
 // Peek mode renders at half scale (2:1 nearest-neighbor in gifDrawCb)
@@ -368,12 +362,13 @@ void characterRenderTo(TFT_eSPI* tgt, int cx, int cy) {
   _tgt = tgt; peekMode = true;
   gifX = cx - gifW / 4;
   gifY = cy - gifH / 4;
-  uint32_t now = millis();
-  if (now >= nextFrameAt) {
-    int delayMs = 0;
-    if (!gif.playFrame(false, &delayMs)) { gif.reset(); gif.playFrame(false, &delayMs); }
-    nextFrameAt = now + (delayMs > 0 ? delayMs : 100);
-  }
+  // Always advance one frame — AnimatedGIF has no "re-paint current"
+  // call, and callers can hit us out of band (settings-menu mini)
+  // where the home-tick frame timer doesn't apply. Caller throttles
+  // their invocation rate (landscape clock = 5 Hz, menu = render rate).
+  int delayMs = 0;
+  if (!gif.playFrame(false, &delayMs)) { gif.reset(); gif.playFrame(false, &delayMs); }
+  nextFrameAt = millis() + (delayMs > 0 ? delayMs : 100);
   _tgt = prevT; peekMode = prevP; gifX = px; gifY = py;
 }
 

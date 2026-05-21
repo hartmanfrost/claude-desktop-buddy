@@ -585,14 +585,15 @@ static void drawSettings() {
           spr.setTextDatum(TR_DATUM);
           spr.drawString(nm, mx + mw - 6, rowY + MENU_LINE_H);
           spr.setTextDatum(TL_DATUM);
-          // Mini preview of the active pet on the line below the name.
-          // GIF packs render via characterRenderTo (peek path — half-
-          // scale, ~48×50 for a 96×100 source); the box is filled with
-          // the pack's pal.bg first so transparent pixels (rendered as
-          // pal.bg by gifDrawCb) blend with the box, not the menu PANEL.
-          // ASCII species fall back to a body-colour disc placeholder.
+          // Mini preview, right-aligned under the pet name (same 6 px
+          // right padding as the name drawString above). GIF packs
+          // render via characterRenderTo (peek path — half-scale,
+          // ~48×50 for a 96×100 source); the box is filled with the
+          // pack's pal.bg first so transparent pixels (rendered as
+          // pal.bg by gifDrawCb) blend with the box, not the menu
+          // PANEL. ASCII species fall back to a body-colour disc.
           int boxW = 56, boxH = 56;
-          int boxX = (mw - boxW) / 2 + mx;
+          int boxX = mx + mw - 6 - boxW;
           int boxY = rowY + MENU_LINE_H * 2;
           if (!buddyMode && characterLoaded()) {
             uint16_t bg = characterPalette().bg;
