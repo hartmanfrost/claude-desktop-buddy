@@ -580,7 +580,7 @@ void drawMenu() {
     spr.setCursor(mx + 6, my + MENU_PAD_TOP + i * MENU_LINE_H);
     spr.print(sel ? "> " : "  ");
     spr.print(menuItems[i]);
-    if (i == 4) spr.print(dataDemo() ? "  on" : "  off");
+    if (i == 5) spr.print(dataDemo() ? "  on" : "  off");
   }
   spr.setFont(&fonts::Font0);
   drawMenuHints(p, mx, mw, my + mh - 14);
@@ -1253,6 +1253,22 @@ void drawPet() {
 void drawHUD() {
   if (tama.promptId[0]) { drawApproval(); return; }
   const Palette& p = characterPalette();
+  // Small clock at the top-centre of the home screen — sits above the
+  // pet character. Centre placement avoids the panel's rounded corners
+  // clipping the digits. Only renders when the wall clock is actually
+  // valid (NTP / desktop has synced). Cleared each frame so character
+  // particles (Zzz, hearts) don't bleed over.
+  if (dataRtcValid()) {
+    const int CW = 34, CH = 10;
+    spr.fillRect((W - CW) / 2, 0, CW, CH, p.bg);
+    spr.setFont(&fonts::Font0);
+    spr.setTextSize(1);
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setTextDatum(TC_DATUM);
+    char hm[8]; snprintf(hm, sizeof(hm), "%02u:%02u", _clkTm.Hours, _clkTm.Minutes);
+    spr.drawString(hm, W / 2, 2);
+    spr.setTextDatum(TL_DATUM);
+  }
   // u8g2 8x13 monospace Cyrillic font. 172 px / 8 = 21 chars per row.
   // LH bumped to 14 to keep a 1 px gap between rows at the new font
   // height (13 px glyphs).
@@ -1775,16 +1791,26 @@ void loop() {
   }
   if (landscapeClock) {
     drawClock();
-  } else if (!statsIsNapping() && !screenOff) {
-    if (blePasskey()) drawPasskey();
-    else if (clocking) drawClock();
-    else if (displayMode == DISP_INFO) drawInfo();
-    else if (displayMode == DISP_PET) drawPet();
-    else if (settings().hud) drawHUD();
-    if (resetOpen) drawReset();
-    else if (settingsOpen) drawSettings();
-    else if (menuOpen) drawMenu();
-    spr.pushSprite(0, 0);
+  } else if (!screenOff) {
+    // Special case: when the device is both clocking (1 min idle) and
+    // napping (5 min idle), the upper-render skip above was leaving the
+    // sprite frozen and drawClock was gated behind !statsIsNapping(), so
+    // the screensaver locked at the moment nap kicked in. Always paint +
+    // push the clock face while clocking, even mid-nap.
+    if (statsIsNapping() && clocking) {
+      drawClock();
+      spr.pushSprite(0, 0);
+    } else if (!statsIsNapping()) {
+      if (blePasskey()) drawPasskey();
+      else if (clocking) drawClock();
+      else if (displayMode == DISP_INFO) drawInfo();
+      else if (displayMode == DISP_PET) drawPet();
+      else if (settings().hud) drawHUD();
+      if (resetOpen) drawReset();
+      else if (settingsOpen) drawSettings();
+      else if (menuOpen) drawMenu();
+      spr.pushSprite(0, 0);
+    }
   }
 
   // Idle-based nap: no IMU on this board, so the old face-down detector is
