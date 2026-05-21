@@ -274,6 +274,29 @@ bool characterInit(const char* name) {
 bool characterLoaded() { return loaded; }
 const Palette& characterPalette() { return pal; }
 
+uint8_t characterListInstalled(char outNames[][24], uint8_t maxN) {
+  if (!LittleFS.begin(false)) {
+    if (!LittleFS.open("/")) return 0;
+  }
+  File d = LittleFS.open("/characters");
+  if (!d || !d.isDirectory()) return 0;
+  uint8_t n = 0;
+  File e = d.openNextFile();
+  while (e && n < maxN) {
+    if (e.isDirectory()) {
+      const char* raw = e.name();
+      const char* nm  = strrchr(raw, '/');
+      nm = nm ? nm + 1 : raw;
+      strncpy(outNames[n], nm, 23);
+      outNames[n][23] = 0;
+      n++;
+    }
+    e = d.openNextFile();
+  }
+  d.close();
+  return n;
+}
+
 // One-shot half-scale render to an arbitrary surface (M5.Lcd for the
 // landscape clock). Caller owns clearing. Advances frame timing so
 // animation runs even when characterTick() is bypassed.

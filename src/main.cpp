@@ -79,21 +79,67 @@ bool     screenOff = false;
 bool     swallowBtnA = false;
 bool     swallowBtnB = false;
 bool     buddyMode = false;
-bool     gifAvailable = false;
-const uint8_t SPECIES_GIF = 0xFF;   // species NVS sentinel: use the installed GIF
+bool     gifAvailable = false;            // any GIF pack present (preserved name for xfer.h)
+const uint8_t SPECIES_GIF = 0xFF;   // species NVS sentinel: use a GIF pack
 
-// Cycle GIF (if installed) → ASCII species 0..N-1 → GIF. Persisted to the
-// existing "species" NVS key; 0xFF means GIF mode.
+// Installed GIF packs (scanned at boot from /characters/). With all four
+// bundled (bufo, cogito, clawd, hoodie) plus optional user uploads we
+// cap at 8 — plenty of headroom, and the names array is fixed-size to
+// avoid heap fragmentation on a long-running device.
+static const uint8_t GIFS_MAX = 8;
+static char     gifNames[GIFS_MAX][24];
+static uint8_t  gifCount = 0;
+uint8_t         gifIdx   = 0;             // external linkage — xfer.h patches it after folder push
+
+// Persisted GIF selection — Preferences NVS, namespace "buddy", key "gif".
+// Survives reboots so the user keeps the pack they picked.
+static uint8_t gifIdxLoad() {
+  Preferences p; p.begin("buddy", true);
+  uint8_t v = p.getUChar("gif", 0);
+  p.end();
+  return v;
+}
+static void gifIdxSave(uint8_t v) {
+  Preferences p; p.begin("buddy", false);
+  p.putUChar("gif", v);
+  p.end();
+}
+
+// Refresh `gifNames` / `gifCount` from LittleFS. Called at boot and again
+// after a folder-push transfer that touches /characters/ (xfer.h's
+// char_end path).
+void refreshGifList() {
+  gifCount = characterListInstalled(gifNames, GIFS_MAX);
+  gifAvailable = (gifCount > 0);
+  if (gifIdx >= gifCount) gifIdx = 0;
+}
+
+// Cycle GIF[0..M-1] → ASCII species 0..N-1 → GIF[0]. The combined
+// position is gifIdx-or-species-idx; the persisted "species" NVS key
+// stays 0xFF whenever we're on any GIF, and the GIF index itself
+// persists under the new "gif" key.
 static void nextPet() {
-  uint8_t n = buddySpeciesCount();
-  if (!buddyMode) {                          // GIF → species 0
-    buddyMode = true;
-    buddySetSpeciesIdx(0);
-    speciesIdxSave(0);
-  } else if (buddySpeciesIdx() + 1 >= n && gifAvailable) {  // last species → GIF
+  uint8_t nSp = buddySpeciesCount();
+  if (!buddyMode) {
+    // Currently on a GIF — advance within the GIF pool first.
+    if (gifIdx + 1 < gifCount) {
+      gifIdx++;
+      gifIdxSave(gifIdx);
+      characterInit(gifNames[gifIdx]);
+    } else {
+      // Past the last GIF → jump to species 0.
+      buddyMode = true;
+      buddySetSpeciesIdx(0);
+      speciesIdxSave(0);
+    }
+  } else if (buddySpeciesIdx() + 1 >= nSp && gifAvailable) {
+    // Past the last species → wrap back to GIF[0].
     buddyMode = false;
+    gifIdx = 0;
+    gifIdxSave(0);
     speciesIdxSave(SPECIES_GIF);
-  } else {                                   // species i → species i+1
+    characterInit(gifNames[gifIdx]);
+  } else {
     buddyNextSpecies();
   }
   characterInvalidate();
@@ -510,8 +556,10 @@ static void drawSettings() {
       static const char* const RN[] = { "auto", "port", "land" };
       spr.print(RN[s.clockRot]);
     } else if (i == 7) {
-      uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
-      uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
+      // Combined position across all GIF packs + ASCII species.
+      uint8_t total = buddySpeciesCount() + gifCount;
+      uint8_t pos   = buddyMode ? (gifCount + buddySpeciesIdx() + 1)
+                                : (gifIdx + 1);
       spr.printf("%u/%u", pos, total);
     }
   }
@@ -1467,8 +1515,13 @@ void setup() {
 
   // BLE stays always-on; s.bt is stored as a preference only.
   spr.createSprite(W, H);
-  characterInit(nullptr);  // scan /characters/ for whatever is installed
-  gifAvailable = characterLoaded();
+  // Scan /characters/ once, populate gifNames[]. Pick the previously-
+  // selected pack from NVS (clamped if it's gone — e.g. after a folder
+  // push wiped it), then load it.
+  refreshGifList();
+  gifIdx = gifIdxLoad();
+  if (gifIdx >= gifCount) gifIdx = 0;
+  if (gifCount > 0) characterInit(gifNames[gifIdx]);
 
   // WiFi: read /config/wifi.json, scan, connect to strongest saved AP.
   // Non-blocking — wifiLinkTick() drives the state machine from loop().

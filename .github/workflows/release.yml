@@ -84,19 +84,44 @@ jobs:
           FIRMWARE_VERSION: ${{ steps.ver.outputs.version }}
         run: pio run -e waveshare-esp32-c6
 
+      - name: Stage character packs for LittleFS image
+        # characters/ is the canonical source (committed); data/ is the
+        # gitignored staging dir PlatformIO's buildfs reads from. Copy
+        # everything so the image bundles bufo + cogito + clawd + hoodie.
+        run: |
+          mkdir -p data/characters
+          rm -rf data/characters/*
+          if [ -d characters ]; then
+            for d in characters/*/; do
+              [ -d "$d" ] || continue
+              cp -R "$d" data/characters/
+            done
+            ls -la data/characters/
+          fi
+
+      - name: Build LittleFS image (bundles all 4 character packs)
+        env:
+          FIRMWARE_VERSION: ${{ steps.ver.outputs.version }}
+        run: pio run -e waveshare-esp32-c6 -t buildfs
+
       - name: Stage artifacts
         run: |
           mkdir -p dist
           cp .pio/build/waveshare-esp32-c6/firmware.bin   dist/firmware-waveshare-c6.bin
           cp .pio/build/waveshare-esp32-c6/bootloader.bin dist/bootloader.bin
           cp .pio/build/waveshare-esp32-c6/partitions.bin dist/partitions.bin
-          # Optional character packs — bundle the GIF folders from
-          # characters/ into a single zip so users can grab the lot and
-          # drop individual folders onto Hardware Buddy. bufo is shipped
-          # in the LittleFS image itself; this asset is the alternates
-          # (cogito, clawd, hoodie, …).
+          # littlefs.bin ships the bundled character packs (bufo +
+          # cogito + clawd + hoodie). USB-flash this once at offset
+          # 0x200000 to get all packs on a device that was upgraded via
+          # firmware-only OTA — the OTA flow never touches the LittleFS
+          # partition, so existing devices that only had bufo stay at
+          # one pack until this image is flashed.
+          cp .pio/build/waveshare-esp32-c6/littlefs.bin   dist/littlefs.bin
+          # Character packs zip — every folder under characters/, including
+          # bufo. User can grab one pack out and drop it via Hardware
+          # Buddy if they want to swap rather than re-flash LittleFS.
           if [ -d characters ]; then
-            extras=$(ls characters/ | grep -v '^bufo$' | grep -v '\.' || true)
+            extras=$(ls characters/ | grep -v '\.' || true)
             if [ -n "$extras" ]; then
               (cd characters && zip -qr ../dist/character-packs.zip $extras)
               ls -lh dist/character-packs.zip
@@ -127,5 +152,6 @@ jobs:
             dist/firmware-waveshare-c6.bin
             dist/bootloader.bin
             dist/partitions.bin
+            dist/littlefs.bin
             dist/SHA256SUMS.txt
             dist/character-packs.zip

@@ -29,3 +29,9 @@ void characterSetPeek(bool peek);
 void characterRenderTo(TFT_eSPI* tgt, int cx, int cy);
 
 const Palette& characterPalette();
+
+// Scan /characters/ on LittleFS and fill `outNames` with up to
+// `maxN` directory names (each ≤ 23 chars + NUL). Returns the count
+// actually written. Used by main.cpp to maintain the active list of
+// installed GIF packs so nextPet() can cycle through them.
+uint8_t characterListInstalled(char outNames[][24], uint8_t maxN);

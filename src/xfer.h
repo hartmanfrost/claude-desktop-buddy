@@ -345,7 +345,16 @@ inline bool xferCommand(JsonDocument& doc) {
     if (_xCharWiped) {
       ok = characterInit(_xCharName);
       extern bool buddyMode, gifAvailable;
-      if (ok) { buddyMode = false; gifAvailable = true; speciesIdxSave(0xFF); }
+      extern void refreshGifList();
+      extern uint8_t gifIdx;
+      if (ok) {
+        // The wipe + new upload means /characters/ now holds exactly
+        // one pack — refresh the list and point gifIdx at it.
+        refreshGifList();
+        gifIdx = 0;
+        buddyMode = false;
+        speciesIdxSave(0xFF);
+      }
     } else {
       // Pure config-file transfer (only wifi.json or similar). Nothing
       // to initialise; bufo (or whatever was installed) is still there.
