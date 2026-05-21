@@ -163,14 +163,19 @@ static bool _doCheck() {
     return false;
   }
 
-  // Filter to keep heap small — release JSON can be 10-20KB but we only
-  // need tag_name. ArduinoJson v7 stream filter pattern.
+  // HTTPClient::getStream() chunked-decode path returned IncompleteInput
+  // to ArduinoJson under arduino-esp32 v3.x — body wasn't drained before
+  // the stream EOF'd. getString() blocks until the whole body lands, then
+  // we parse from the in-memory copy. Release JSON is ~10-20KB so this
+  // costs us heap briefly but is reliable.
+  String body = http.getString();
+  http.end();
+
   JsonDocument filter;
   filter["tag_name"] = true;
   JsonDocument doc;
   DeserializationError derr = deserializeJson(
-    doc, http.getStream(), DeserializationOption::Filter(filter));
-  http.end();
+    doc, body, DeserializationOption::Filter(filter));
 
   if (derr) {
     char buf[64];
