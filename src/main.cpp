@@ -56,6 +56,9 @@ unsigned long t = 0;
 // Menu
 bool    menuOpen    = false;
 uint8_t menuSel     = 0;
+// brightLevel mirrors settings().bright so the rest of the codebase can read
+// it as a plain uint8_t without pulling stats.h into every TU. Initialised
+// to max; settingsLoad() in setup() overwrites it with the persisted value.
 uint8_t brightLevel = 4;           // 0..4 → ScreenBreath 20..100
 bool    btnALong    = false;
 
@@ -165,8 +168,9 @@ static void applySetting(uint8_t idx) {
   switch (idx) {
     case 0:
       brightLevel = (brightLevel + 1) % 5;
+      s.bright = brightLevel;        // persist; falls through to settingsSave()
       applyBrightness();
-      return;
+      break;
     case 1: s.sound = !s.sound; break;
     case 2:
       // BT toggle is a stored preference only — BLE stays live. Turning
@@ -718,7 +722,7 @@ void drawInfo() {
     ln("Felix Rieseberg");
     y += 8;
     spr.setTextColor(p.textDim, p.bg);
-    ln("build by");
+    ln("built by");
     y += 4;
     spr.setTextColor(p.text, p.bg);
     ln("Vladyslav Kovalenko");
@@ -730,6 +734,11 @@ void drawInfo() {
     ln("github.com/anthropics");
     ln("/claude-desktop-buddy");
     y += 12;
+    spr.setTextColor(p.textDim, p.bg);
+    ln("firmware");
+    y += 4;
+    ln(otaCurrentVersion());
+    y += 8;
     spr.setTextColor(p.textDim, p.bg);
     ln("hardware");
     y += 4;
@@ -1088,10 +1097,14 @@ void setup() {
   M5.Beep.begin();
   startBt();
   if (LED_PIN >= 0) { pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, HIGH); }
-  applyBrightness();
   lastInteractMs = millis();
   statsLoad();
   settingsLoad();
+  // Hydrate global brightLevel from persisted setting before the first
+  // applyBrightness() call — otherwise the screen briefly flashes at
+  // hardcoded default 4 before settling on whatever the user picked.
+  brightLevel = settings().bright;
+  applyBrightness();
   petNameLoad();
   buddyInit();
 

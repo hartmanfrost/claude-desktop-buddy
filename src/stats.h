@@ -251,9 +251,10 @@ struct Settings {
   bool led;
   bool hud;
   uint8_t clockRot;  // 0=auto 1=portrait 2=landscape
+  uint8_t bright;    // 0..4 → ScreenBreath 20..100 in applyBrightness()
 };
 
-static Settings _settings = { true, true, false, true, true, 0 };
+static Settings _settings = { true, true, false, true, true, 0, 4 };
 
 inline void settingsLoad() {
   _prefs.begin("buddy", true);
@@ -264,6 +265,11 @@ inline void settingsLoad() {
   _settings.hud      = _prefs.getBool("s_hud", true);
   _settings.clockRot = _prefs.getUChar("s_crot", 0);
   if (_settings.clockRot > 2) _settings.clockRot = 0;
+  // Default 4 (max) matches the hardcoded init used before persistence.
+  // Devices upgrading from older firmware land on this default; first
+  // brightness change writes the key and it sticks from then on.
+  _settings.bright = _prefs.getUChar("s_bright", 4);
+  if (_settings.bright > 4) _settings.bright = 4;
   _prefs.end();
 }
 
@@ -275,6 +281,7 @@ inline void settingsSave() {
   _prefs.putBool("s_led", _settings.led);
   _prefs.putBool("s_hud", _settings.hud);
   _prefs.putUChar("s_crot", _settings.clockRot);
+  _prefs.putUChar("s_bright", _settings.bright);
   _prefs.end();
 }
 
