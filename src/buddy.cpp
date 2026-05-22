@@ -42,6 +42,13 @@ static TFT_eSPI* _tgt = &spr;
 // and re-center per line so the padding doesn't push ink off-screen.
 static uint8_t _scale = 1;
 
+// Translation applied on top of the species' hardcoded coordinates.
+// Stays at (0, 0) for normal rendering; buddyShift() flips it to put
+// the buddy into a custom area (e.g. the settings-menu mini box).
+static int _xOff = 0;
+static int _yOff = 0;
+void buddyShift(int dx, int dy) { _xOff = dx; _yOff = dy; }
+
 void buddyPrintLine(const char* line, int yPx, uint16_t color, int xOff) {
   int len = strlen(line);
   if (_scale > 1) {
@@ -49,9 +56,9 @@ void buddyPrintLine(const char* line, int yPx, uint16_t color, int xOff) {
     while (len && *line == ' ')       { line++; len--; }
   }
   int w = len * BUDDY_CHAR_W * _scale;
-  int x = BUDDY_X_CENTER - w / 2 + xOff * _scale;
+  int x = BUDDY_X_CENTER - w / 2 + xOff * _scale + _xOff;
   _tgt->setTextColor(color, BUDDY_BG);
-  _tgt->setCursor(x, yPx);
+  _tgt->setCursor(x, yPx + _yOff);
   for (int i = 0; i < len; i++) _tgt->print(line[i]);
 }
 
@@ -66,7 +73,8 @@ void buddyPrintSprite(const char* const* lines, uint8_t nLines, int yOffset, uin
 // Species pass 1× coords (relative to BUDDY_X_CENTER / BUDDY_Y_OVERLAY);
 // transform here so all 18 species files stay scale-agnostic.
 void buddySetCursor(int x, int y) {
-  _tgt->setCursor(BUDDY_X_CENTER + (x - BUDDY_X_CENTER) * _scale, y * _scale);
+  _tgt->setCursor(BUDDY_X_CENTER + (x - BUDDY_X_CENTER) * _scale + _xOff,
+                  y * _scale + _yOff);
 }
 void buddySetColor(uint16_t fg)   { _tgt->setTextColor(fg, BUDDY_BG); }
 void buddyPrint(const char* s)    { _tgt->setTextSize(_scale); _tgt->print(s); }

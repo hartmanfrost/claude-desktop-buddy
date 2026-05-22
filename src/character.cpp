@@ -64,10 +64,13 @@ static TFT_eSPI*   _tgt = &spr;
 // the legs clips off-panel.
 //
 // num/den convention:
-//   num >= 1, den == 1 → integer upscale  (e.g. 2/1 = 2× bigger)
-//   num == 1, den >= 2 → integer downscale (e.g. 1/2 = half-size)
-static int8_t gifScaleNum = 2;
-static int8_t gifScaleDen = 1;
+//   num/den > 1 → upscale  (e.g. 2/1 = 2× bigger, 320/217 ≈ 1.475×)
+//   num/den < 1 → downscale (e.g. 1/2 = half-size)
+// int16_t because the height-fit case stores panel_height (320) here —
+// int8_t silently truncated 320 to 64, which painted hoodie at zero
+// effective scale and hid the pet entirely.
+static int16_t gifScaleNum = 2;
+static int16_t gifScaleDen = 1;
 
 // Cached "tall pack" flag for the rest of the rendering pipeline. True
 // when the upscaled pet would overflow the old home strip (y=0..250);

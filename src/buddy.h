@@ -21,6 +21,12 @@ uint8_t buddySpeciesIdx();
 uint8_t buddySpeciesCount();
 const char* buddySpeciesName();
 
+// Shift every subsequent buddy draw by (dx, dy) px. Reset by calling
+// with (0, 0). Used by the settings-menu mini preview to render the
+// ASCII species inside the thumbnail box without touching the species'
+// hardcoded BUDDY_X_CENTER / BUDDY_Y_BASE coordinates.
+void buddyShift(int dx, int dy);
+
 // Per-species state function: takes the global tickCount and renders
 // the buddy + any overlays for the current state into the shared sprite.
 typedef void (*StateFn)(uint32_t t);

@@ -601,11 +601,19 @@ static void drawSettings() {
             spr.drawRoundRect(boxX, boxY, boxW, boxH, 3, p.textDim);
             characterRenderTo(&spr, boxX + boxW/2, boxY + boxH/2);
           } else if (buddyMode) {
-            uint16_t body = characterPalette().body;
-            spr.fillRoundRect(boxX, boxY, boxW, boxH, 3, PANEL);
+            // ASCII species render. buddyRenderTo paints at the
+            // species' hardcoded center (BUDDY_X_CENTER=86,
+            // BUDDY_Y_BASE=30) at 1× scale; buddyShift translates that
+            // into the mini box, then resets. PANEL-coloured frame so
+            // the buddy's transparent backdrop (BUDDY_BG=0x0000 black)
+            // doesn't show through and clash with the menu.
+            spr.fillRoundRect(boxX, boxY, boxW, boxH, 3, 0x0000);
             spr.drawRoundRect(boxX, boxY, boxW, boxH, 3, p.textDim);
-            spr.fillCircle(boxX + boxW/2, boxY + boxH/2, 10, body);
-            spr.drawCircle(boxX + boxW/2, boxY + boxH/2, 10, p.text);
+            int dx = (boxX + boxW/2) - 86;     // BUDDY_X_CENTER
+            int dy = (boxY + boxH/2) - 30;     // BUDDY_Y_BASE
+            buddyShift(dx, dy);
+            buddyRenderTo(&spr, 1 /* P_IDLE */);
+            buddyShift(0, 0);
           }
         }
       }
