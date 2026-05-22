@@ -45,6 +45,13 @@ static int         gifX = 0, gifY = 0, gifW = 0, gifH = 0;
 // sits on the panel edge regardless of canvas height. Home mode centers
 // in the upper 140px. No padding assumed in the source art.
 static const int   PEEK_TOP = 70;
+
+// Peek-mode vertical clip bounds. Default = home clocking peek (upper
+// 70 px strip). characterRenderTo overrides these per-call so the
+// settings-menu thumbnail can land anywhere on the panel without the
+// PEEK_TOP clip rejecting every row.
+static int peekYClipLo = 0;
+static int peekYClipHi = PEEK_TOP;
 static bool        peekMode = false;
 // Draw target — defaults to the sprite; characterRenderTo() retargets to
 // M5.Lcd for the landscape clock (both inherit TFT_eSPI).
@@ -70,13 +77,25 @@ static bool   gifTallHome = false;
 static const int HOME_AREA_H = 250;   // legacy home strip — used for short-pet vertical centring
 
 static void gifComputeScale() {
-  // Hard-pin 2× upscale — that's what every bundled pack was authored
-  // for. Tall packs (hoodie at 2× = 192×434 vs 320 panel) clip
-  // vertically below the panel; gifPlace anchors them at the top so
-  // the face stays visible and the bottom of the body clips into the
-  // HUD strip, which then overlays on top via the normal draw order.
-  // Genuinely-tiny GIFs and absurdly-large ones would deserve a real
-  // fit-search, but none of the current packs need it.
+  const int W = spr.width(), H = spr.height();
+  // Three strategies depending on the source canvas orientation:
+  //
+  // 1. Tall portrait (gifH > W)  → scale until height fills the panel.
+  //    For hoodie 96×217 this yields num/den=320/217 ≈ 1.475×, so the
+  //    pet renders at ~141×320, fits height exactly, doesn't waste
+  //    horizontal space.
+  // 2. Wide landscape (gifW > H) → scale until width fills the panel.
+  //    Symmetric, no bundled pack hits this today but the rule covers
+  //    future submissions.
+  // 3. Roughly square (96×100 et al.) → stick to the 2× upstream
+  //    upscale (192×200), accept the small horizontal clip the
+  //    upstream firmware already accepted.
+  if (gifH > W) {
+    gifScaleNum = H; gifScaleDen = gifH; return;
+  }
+  if (gifW > H) {
+    gifScaleNum = W; gifScaleDen = gifW; return;
+  }
   gifScaleNum = 2; gifScaleDen = 1;
 }
 
@@ -99,9 +118,12 @@ static void gifPlace() {
   } else if (outH <= HOME_AREA_H) {
     gifTallHome = false;
     gifY = (HOME_AREA_H - outH) / 2;        // legacy upper-strip centre
+  } else if (outH >= spr.height()) {
+    gifTallHome = true;
+    gifY = 0;                               // exactly-fit-or-overflow: use the whole panel
   } else {
     gifTallHome = true;
-    gifY = 16;                              // anchor at top, bottom clips
+    gifY = 16;                              // anchor top, bottom clips into HUD
   }
 }
 
@@ -170,48 +192,38 @@ static void gifDrawCb(GIFDRAW* d) {
   if (peekMode) {
     if (srcY & 1) return;
     int y = gifY + (srcY >> 1);
-    if (y < 0 || y >= PEEK_TOP) return;
+    if (y < peekYClipLo || y >= peekYClipHi) return;
     int x0 = gifX + (d->iX >> 1);
     int w  = d->iWidth >> 1;
     for (int i = 0; i < w; i++) put(x0 + i, y, src[i << 1]);
     return;
   }
 
-  // Home mode: scale by gifScaleNum / gifScaleDen, computed per-pack
-  // in gifComputeScale(). Upscale path expands each source pixel into
-  // an N×N block; downscale path samples every D-th row/col (mirrors
-  // the peek path's halving). HUD transcript renders later in the
-  // frame so a tall GIF that reaches the bottom of the panel just
-  // gets the text overlaid on top — no implicit reserved strip.
-  if (gifScaleDen > 1) {
-    const int D = gifScaleDen;
-    if (srcY % D != 0) return;
-    int y = gifY + srcY / D;
-    if (y < 0 || y >= spr.height()) return;
-    int x0 = gifX + d->iX / D;
-    int w  = d->iWidth / D;
-    for (int i = 0; i < w; i++) {
-      int xx = x0 + i;
-      if (xx < 0 || xx >= spr.width()) continue;
-      put(xx, y, src[i * D]);
-    }
-    return;
-  }
-  const int S = gifScaleNum;
-  int y0 = gifY + srcY * S;
-  if (y0 + S <= 0 || y0 >= spr.height()) return;
-  int x0 = gifX + d->iX * S;
-  int w  = d->iWidth;
-  for (int i = 0; i < w; i++) {
-    uint8_t idx = src[i];
-    uint16_t color = (hasT && idx == t) ? pal.bg : pal16[idx];
-    int dx = x0 + i * S;
-    for (int sy = 0; sy < S; sy++) {
-      int dy = y0 + sy;
-      if (dy < 0 || dy >= spr.height()) continue;
-      for (int sx = 0; sx < S; sx++) {
-        int xx = dx + sx;
-        if (xx < 0 || xx >= spr.width()) continue;
+  // Home mode: rational scale by gifScaleNum / gifScaleDen, set per-
+  // pack in gifComputeScale(). Same formula handles integer upscale
+  // (2/1, 3/1 …), fractional fit-to-panel (320/217 for hoodie), and
+  // integer downscale (1/2 …): for each source pixel compute its
+  // output-pixel range via floor((s*num)/den), paint every covered
+  // output coordinate. Empty range = pixel sampled out, skip.
+  const int num = gifScaleNum, den = gifScaleDen;
+  int oy0 = (srcY * num) / den;
+  int oy1 = ((srcY + 1) * num) / den;
+  if (oy0 == oy1) return;
+  const int sprW = spr.width(), sprH = spr.height();
+  const int dx0 = d->iX;
+  const int w   = d->iWidth;
+  for (int oy = oy0; oy < oy1; oy++) {
+    int dy = gifY + oy;
+    if (dy < 0 || dy >= sprH) continue;
+    for (int sx = 0; sx < w; sx++) {
+      int ox0 = ((dx0 + sx) * num) / den;
+      int ox1 = ((dx0 + sx + 1) * num) / den;
+      if (ox0 == ox1) continue;
+      uint8_t idx = src[sx];
+      uint16_t color = (hasT && idx == t) ? pal.bg : pal16[idx];
+      for (int ox = ox0; ox < ox1; ox++) {
+        int xx = gifX + ox;
+        if (xx < 0 || xx >= sprW) continue;
         _tgt->drawPixel(xx, dy, color);
       }
     }
@@ -359,9 +371,15 @@ uint8_t characterListInstalled(char outNames[][24], uint8_t maxN) {
 void characterRenderTo(TFT_eSPI* tgt, int cx, int cy) {
   if (!gifOpen) return;   // caller opens via characterSetState(activeState)
   TFT_eSPI* prevT = _tgt; bool prevP = peekMode; int px = gifX, py = gifY;
+  int prevLo = peekYClipLo, prevHi = peekYClipHi;
   _tgt = tgt; peekMode = true;
   gifX = cx - gifW / 4;
   gifY = cy - gifH / 4;
+  // Override the peek vertical clip to the box implied by our (cx, cy)
+  // centre — without this the default [0, PEEK_TOP) rejects every row
+  // when the menu thumbnail lands at y > 70.
+  peekYClipLo = gifY;
+  peekYClipHi = gifY + gifH / 2 + 1;
   // Always advance one frame — AnimatedGIF has no "re-paint current"
   // call, and callers can hit us out of band (settings-menu mini)
   // where the home-tick frame timer doesn't apply. Caller throttles
@@ -370,6 +388,7 @@ void characterRenderTo(TFT_eSPI* tgt, int cx, int cy) {
   if (!gif.playFrame(false, &delayMs)) { gif.reset(); gif.playFrame(false, &delayMs); }
   nextFrameAt = millis() + (delayMs > 0 ? delayMs : 100);
   _tgt = prevT; peekMode = prevP; gifX = px; gifY = py;
+  peekYClipLo = prevLo; peekYClipHi = prevHi;
 }
 
 void characterSetPeek(bool peek) {
