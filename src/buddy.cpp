@@ -51,10 +51,14 @@ void buddyShift(int dx, int dy) { _xOff = dx; _yOff = dy; }
 
 void buddyPrintLine(const char* line, int yPx, uint16_t color, int xOff) {
   int len = strlen(line);
-  if (_scale > 1) {
-    while (len && line[len-1] == ' ') len--;
-    while (len && *line == ' ')       { line++; len--; }
-  }
+  // Trim leading/trailing spaces at every scale. The space padding in
+  // species art exists so the variable-width body lines align under
+  // setTextSize(2) — once each line is centred around BUDDY_X_CENTER
+  // (we recompute width here) the padding adds nothing but extra
+  // pixels off the side, which clipped neatly on the 172 px home
+  // panel but pokes out of the 56 px settings-menu mini box.
+  while (len && line[len-1] == ' ') len--;
+  while (len && *line == ' ')       { line++; len--; }
   int w = len * BUDDY_CHAR_W * _scale;
   int x = BUDDY_X_CENTER - w / 2 + xOff * _scale + _xOff;
   _tgt->setTextColor(color, BUDDY_BG);

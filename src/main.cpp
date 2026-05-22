@@ -602,15 +602,16 @@ static void drawSettings() {
             characterRenderTo(&spr, boxX + boxW/2, boxY + boxH/2);
           } else if (buddyMode) {
             // ASCII species render. buddyRenderTo paints at the
-            // species' hardcoded center (BUDDY_X_CENTER=86,
-            // BUDDY_Y_BASE=30) at 1× scale; buddyShift translates that
-            // into the mini box, then resets. PANEL-coloured frame so
-            // the buddy's transparent backdrop (BUDDY_BG=0x0000 black)
-            // doesn't show through and clash with the menu.
+            // species' hardcoded geometry at 1× scale: body lines run
+            // from BUDDY_Y_BASE=30 down ~6 rows of 8 px each, so the
+            // body's visual centre sits ~24 px below BUDDY_Y_BASE.
+            // buddyShift translates so that visual centre lands at the
+            // box centre, putting the species inside the frame instead
+            // of dangling off the bottom.
             spr.fillRoundRect(boxX, boxY, boxW, boxH, 3, 0x0000);
             spr.drawRoundRect(boxX, boxY, boxW, boxH, 3, p.textDim);
-            int dx = (boxX + boxW/2) - 86;     // BUDDY_X_CENTER
-            int dy = (boxY + boxH/2) - 30;     // BUDDY_Y_BASE
+            int dx = (boxX + boxW/2) - 86;          // BUDDY_X_CENTER
+            int dy = (boxY + boxH/2) - (30 + 24);   // BUDDY_Y_BASE + body half-height
             buddyShift(dx, dy);
             buddyRenderTo(&spr, 1 /* P_IDLE */);
             buddyShift(0, 0);
