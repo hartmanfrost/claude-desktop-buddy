@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <HTTPClient.h>
+#include <esp_sntp.h>
 // arduino-esp32 v3 dropped the implicit `using fs::File`; pull it back so
 // the upstream `File f = LittleFS.open(...)` style keeps compiling.
 using fs::File;
@@ -263,7 +264,12 @@ static void ntpTick() {
     if (t < 1700000000) return;
     _applyTimeUtc((uint32_t)t);
     synced = true;
-    Serial.printf("ntp: initial sync at utc=%lu (tz %+ld)\n",
+    // Stop the background SNTP daemon — it would otherwise periodically
+    // overwrite time(NULL) with real UTC, which our M5Shim-driven local-
+    // epoch convention reads back as a UTC-looking wall clock. From here
+    // on we own the resync schedule via fetchNtpUtc() below.
+    esp_sntp_stop();
+    Serial.printf("ntp: initial sync at utc=%lu (tz %+ld), background sntp stopped\n",
                   (unsigned long)t, (long)_tzOffsetSec);
     return;
   }
